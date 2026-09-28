@@ -1,0 +1,24 @@
+[project]
+name = "mchat"
+version = "2.0.0"
+description = "MChat · Telegram 风格聊天软件（本机演示），内置 Base64 / AES-256 安全工具箱"
+requires-python = ">=3.11"
+dependencies = [
+    "PyQt6>=6.5",
+    "pycryptodome>=3.20",
+]
+
+[project.scripts]
+mchat = "mchat.app:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/ui_probe.py 是被测试文件导入的工具模块，不是测试用例文件
+python_files = ["test_*.py"]
+# Qt 在 pytest 里 grab() 时会抛一条 COM 断连通知（0x80010108），faulthandler 把它当致命
+# 异常打印一大段堆栈，其实用例全绿、退出码 0 —— 关掉 faulthandler 免得刷屏。
+# 真要排查崩溃时手动加回：python -m pytest tests -p faulthandler
+addopts = "-p no:faulthandler"

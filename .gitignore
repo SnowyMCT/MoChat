@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 测试产出的截图
+artifacts/
+
+# 编辑器
+.idea/workspace.xml
+.idea/shelf/
