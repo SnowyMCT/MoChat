@@ -1,11 +1,12 @@
 """动效组件库。
 
-四个可复用组件，全部用 QPropertyAnimation 驱动（Qt 自带插值，稳定 60fps）：
+组件库，前四个用 QPropertyAnimation 驱动（Qt 自带插值，稳定 60fps）：
 
     FloatingLabelInput  悬浮标签输入框  —— Test17 的核心动效，这里通用化
     SegmentedControl    分段切换控件    —— 带滑块动画的"胶囊"选择器
     Toast               提示气泡        —— 淡入淡出 + 上滑，不挤占布局
     CollapsibleSection  折叠容器        —— 高度 + 透明度双动画展开/收起
+    SplitHandle         左右分界线      —— 拖动改变左右区域宽度（自绘，无动画）
 
 性能取舍
 --------
@@ -17,13 +18,45 @@ from __future__ import annotations
 
 from PyQt6.QtCore import (QEasingCurve, QEvent, QPoint, QPropertyAnimation, QRect,
                           QSize, QTimer, Qt, pyqtProperty, pyqtSignal)
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPalette
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPalette
 from PyQt6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
                              QLineEdit, QPlainTextEdit, QSizePolicy, QToolButton,
                              QVBoxLayout, QWidget)
 
 __all__ = ["lerp", "mix_color", "FloatingLabelInput", "SegmentedControl", "Toast",
-           "CollapsibleSection"]
+           "CollapsibleSection", "SplitHandle", "confirm_destructive"]
+
+
+def confirm_destructive(parent, palette, *, title: str, text: str,
+                        ok_text: str = "确定删除") -> bool:
+    """危险操作的二次确认：弹窗 + 红色按钮（删消息、清空历史这类不可撤销的动作）。
+
+    用 `QMessageBox` 而不是自绘对话框：它有平台标准的按键/回车/Esc 行为，
+    这里只把它按主题上个色，并把确认键染红。
+    """
+    from PyQt6.QtWidgets import QMessageBox
+
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle(title)
+    box.setText(text)
+    confirm = box.addButton(ok_text, QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(box.buttons()[-1])                # 默认停在"取消"上，别手滑
+    box.setStyleSheet(f"""
+        QMessageBox {{ background-color: {palette.card}; }}
+        QMessageBox QLabel {{ color: {palette.text}; font-size: 13px; }}
+        QPushButton {{
+            background-color: {palette.track}; color: {palette.text};
+            border: none; border-radius: 8px; padding: 6px 16px; font-size: 13px;
+        }}
+        QPushButton:hover {{ background-color: {palette.border}; }}
+        QPushButton:default, QPushButton:focus {{
+            background-color: {palette.danger}; color: #FFFFFF; font-weight: 600;
+        }}
+    """)
+    box.exec()
+    return box.clickedButton() is confirm
 
 
 def lerp(a: float, b: float, t: float) -> float:
@@ -706,3 +739,121 @@ class CollapsibleSection(QWidget):
     def _on_height_done(self) -> None:
         if not self._expanded:
             self._inner.setVisible(False)
+
+
+# ---------------------------------------------------------------------------
+# 左右分界线
+# ---------------------------------------------------------------------------
+class SplitHandle(QWidget):
+    """侧栏与聊天区之间的可拖动分界线（双击还原默认宽度）。
+
+    自己画，不进全局 QSS：底色与侧栏一致（看着像侧栏一直延伸到分隔线），
+    悬停时中缝变主题色、拖动时中缝加粗并铺一层浅主题底色。切换主题只要
+    重新注入一次颜色令牌即可，不重建样式表。
+
+    宽度只由外部（主窗口）决定：组件只把"光标期望的宽度"发出去，
+    不做任何布局计算——这样夹取范围、持久化都集中在一处。
+    """
+
+    moved = pyqtSignal(int)         # 拖动中：希望的侧栏宽度（未夹取）
+    resetRequested = pyqtSignal()   # 双击：还原默认宽度
+
+    HANDLE_WIDTH = 7                # 可抓取的横向范围（细了不好点）
+
+    def __init__(self, parent: QWidget | None = None, *, sidebar_width: int,
+                 min_width: int, max_width: int):
+        super().__init__(parent)
+        self.setObjectName("splitHandle")
+        self.setFixedWidth(self.HANDLE_WIDTH)
+        self.setCursor(Qt.CursorShape.SplitHCursor)
+        self.setToolTip("拖动可改变会话列表宽度（双击还原）")
+        self._palette = None
+        self._width = int(sidebar_width)
+        self._min = int(min_width)
+        self._max = int(max_width)
+        self._dragging = False
+        self._hover = False
+        self._press_x = 0
+        self._press_width = 0
+
+    # ------------------------------------------------------------------ 对外
+    def sidebar_width(self) -> int:
+        return self._width
+
+    def set_sidebar_width(self, width: int) -> None:
+        """记录当前侧栏宽度（只用于下一次拖动的基准与绘制）。"""
+        self._width = max(self._min, min(self._max, int(width)))
+        self.update()
+
+    def is_dragging(self) -> bool:
+        return self._dragging
+
+    def is_hovered(self) -> bool:
+        return self._hover
+
+    def apply_palette(self, p) -> None:
+        self._palette = p
+        self.update()
+
+    # ------------------------------------------------------------------ 交互
+    def mousePressEvent(self, event) -> None:            # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 记下按下时的全局横坐标与宽度：之后按位移增量算新宽度，
+            # 不依赖事件本身落在分界线的哪一像素上，拖动不会有"跳一下"。
+            self._dragging = True
+            self._press_x = int(event.globalPosition().x())
+            self._press_width = self._width
+            self.update()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:             # noqa: N802
+        if self._dragging:
+            delta = int(event.globalPosition().x()) - self._press_x
+            self.moved.emit(self._press_width + delta)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:          # noqa: N802
+        if self._dragging and event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:      # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.resetRequested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def enterEvent(self, event) -> None:                 # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:                 # noqa: N802
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    # ------------------------------------------------------------------ 绘制
+    def paintEvent(self, event) -> None:                 # noqa: N802
+        p = self._palette
+        if p is None:
+            return
+        if self._dragging:
+            background, line, thickness = p.accent_soft, p.accent, 2
+        elif self._hover:
+            background, line, thickness = p.sidebar_hover, p.accent, 1
+        else:
+            background, line, thickness = p.sidebar, p.border, 1
+
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(background))
+        x = (self.width() - thickness) // 2      # 1px 时偏左一格，避免半像素发虚
+        painter.fillRect(QRect(x, 0, thickness, self.height()), QColor(line))

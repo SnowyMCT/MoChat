@@ -69,8 +69,15 @@ class ChatStore:
             return self._unread.get(conversation_id, 0)
 
     def total_unread(self) -> int:
+        """所有未读之和 —— **免打扰的会话不计**（顶部徽标只提醒"需要你看的"）。"""
         with self._lock:
-            return sum(self._unread.values())
+            total = 0
+            for conversation_id, count in self._unread.items():
+                conversation = self._conversations.get(conversation_id)
+                if conversation is not None and conversation.muted:
+                    continue
+                total += count
+            return total
 
     def search(self, keyword: str) -> list[Conversation]:
         """按会话名或消息内容过滤（空关键词返回全部）。"""
@@ -110,6 +117,75 @@ class ChatStore:
             else:
                 msgs.append(message)
         self._emit(StoreEvent(MESSAGE, message.conversation_id, message))
+
+    def hydrate(self, conversation_id: str, messages: Iterable[Message]) -> int:
+        """把本地历史并进内存（启动时回填）。
+
+        按 id 去重后整体按时间排序 —— 演示数据每次启动都会用"相对现在"的时间戳重建，
+        历史里那些同样的 id 会被新的盖掉，用户自己发过的消息则原样留下，两者都不会重复。
+        """
+        with self._lock:
+            conv = self._conversations.get(conversation_id)
+            if conv is None:
+                return 0
+            merged = {msg.id: msg for msg in conv.messages}
+            added = 0
+            for message in messages:
+                if message.id not in merged:
+                    added += 1
+                elif message.ts <= merged[message.id].ts:
+                    continue                      # 演示数据更新鲜，保留它
+                merged[message.id] = message
+            conv.messages[:] = sorted(merged.values(), key=lambda m: m.ts)
+        self._emit(StoreEvent(RESET, conversation_id))
+        return added
+
+    def remove(self, message_id: str) -> bool:
+        """删掉一条消息（撤回自己的消息用）。"""
+        with self._lock:
+            for conv in self._conversations.values():
+                for index, message in enumerate(conv.messages):
+                    if message.id == message_id:
+                        del conv.messages[index]
+                        conversation_id = conv.id
+                        break
+                else:
+                    continue
+                break
+            else:
+                return False
+        self._emit(StoreEvent(RESET, conversation_id))
+        return True
+
+    def set_pinned(self, conversation_id: str, pinned: bool) -> bool:
+        """置顶/取消置顶。列表顺序跟着变，所以发 RESET 让侧栏整个重建。"""
+        return self.set_flag(conversation_id, "pinned", pinned)
+
+    def set_muted(self, conversation_id: str, muted: bool) -> bool:
+        """免打扰：未读徽标不再计入总数、也不再弹跳（Telegram 的做法）。"""
+        return self.set_flag(conversation_id, "muted", muted)
+
+    def set_flag(self, conversation_id: str, name: str, value: bool) -> bool:
+        """改会话上的布尔旗标（pinned / muted），返回是否真的变了。"""
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None or getattr(conversation, name) == bool(value):
+                return False
+            setattr(conversation, name, bool(value))
+        self._emit(StoreEvent(RESET, conversation_id))
+        return True
+
+    def clear_messages(self, conversation_id: str) -> int:
+        """清空**某一个**会话的消息（会话本身留着），返回删掉几条。"""
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None:
+                return 0
+            removed = len(conversation.messages)
+            conversation.messages.clear()
+            self._unread[conversation_id] = 0
+        self._emit(StoreEvent(RESET, conversation_id))
+        return removed
 
     def receive(self, message: Message) -> None:
         """收到一条消息：先累加未读，再入库。

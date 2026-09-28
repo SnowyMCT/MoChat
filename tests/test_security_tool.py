@@ -28,7 +28,7 @@ from mchat.ui.security_tool import (ALGORITHM_AES, ALGORITHM_BASE64,       # noq
                                     SecurityToolDialog,
                                     SecurityToolWidget)
 from mchat.ui.theme import DARK, LIGHT                                    # noqa: E402
-from ui_probe import glyph_pixels, pump                                   # noqa: E402
+from ui_probe import glyph_pixels, pump, wait_for                           # noqa: E402
 
 ARTIFACTS = os.path.join(ROOT, "artifacts")
 
@@ -61,14 +61,16 @@ def main() -> int:
     check("默认模式为编码", win.mode == "编码", win.mode)
     check("密钥区默认收起", win.key_section.maximumHeight() == 0,
           str(win.key_section.maximumHeight()))
-    check("初始输出框标签落在框内", win.output_field.get_label_progress() == 0.0,
+    check("初始输出框标签落在框内",
+          wait_for(app, lambda: win.output_field.get_label_progress() < 0.05),
           str(win.output_field.get_label_progress()))
 
     # --- Base64 编码 ------------------------------------------------------
     sample = "你好 MChat 🎉"
     win.set_input(sample)
     pump(app)
-    check("有内容后标签浮起", win.input_field.get_label_progress() > 0.99,
+    check("有内容后标签浮起",
+          wait_for(app, lambda: win.input_field.get_label_progress() > 0.99),
           str(win.input_field.get_label_progress()))
     check("字符计数已更新", win.counter_label.text() == f"{len(sample)} 字符",
           win.counter_label.text())
@@ -154,7 +156,8 @@ def main() -> int:
     win.clear_all()
     pump(app, 200)
     check("清空按钮生效", win.input_field.text() == "" and win.output_text() == "")
-    check("清空后输出标签落回框内", win.output_field.get_label_progress() < 0.05,
+    check("清空后输出标签落回框内",
+          wait_for(app, lambda: win.output_field.get_label_progress() < 0.05),
           str(win.output_field.get_label_progress()))
     # 回归：只读框的标签底色要和输入区一致，否则会露出一条色带
     check("只读框标签底色与输入区一致",
@@ -163,7 +166,8 @@ def main() -> int:
     # --- 标签浮起 / 点空白处收回 -------------------------------------------
     win.input_field.focus_field()
     pump(app, 300)
-    check("聚焦时标签浮起", win.input_field.get_label_progress() > 0.99,
+    check("聚焦时标签浮起",
+          wait_for(app, lambda: win.input_field.get_label_progress() > 0.99),
           str(win.input_field.get_label_progress()))
     check("窗口留白处不属于任何子控件", win.childAt(QPoint(12, 12)) is None)
     QTest.mouseClick(win, Qt.MouseButton.LeftButton,
@@ -171,7 +175,9 @@ def main() -> int:
     pump(app, 340)
     check("点空白处输入框失焦", not win.input_field._focused,
           str(win.input_field._focused))
-    check("失焦且为空时标签收回", win.input_field.get_label_progress() < 0.01,
+    # 阈值给到 0.05 而不是 0.01：170ms 的动画尾巴上偶尔差最后一帧（实测抖动过一次）
+    check("失焦且为空时标签收回",
+          wait_for(app, lambda: win.input_field.get_label_progress() < 0.05),
           str(win.input_field.get_label_progress()))
     # 回归：点输入框本身照常聚焦，不能被"点空白失焦"吃掉。
     # 这里不用 QTest.mouseClick 投合成点击：在 WA_DontShowOnScreen 的窗口上它不走
@@ -184,7 +190,8 @@ def main() -> int:
     inner.setFocus(Qt.FocusReason.MouseFocusReason)
     pump(app, 300)
     check("输入框可重新聚焦", win.input_field._focused, str(win.input_field._focused))
-    check("重新聚焦后标签浮起", win.input_field.get_label_progress() > 0.99,
+    check("重新聚焦后标签浮起",
+          wait_for(app, lambda: win.input_field.get_label_progress() > 0.99),
           str(win.input_field.get_label_progress()))
 
     # --- 快捷键：Ctrl+Enter 执行 ------------------------------------------

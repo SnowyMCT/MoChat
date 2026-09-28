@@ -1,37 +1,125 @@
 """左侧会话列表：标题栏（含工具箱入口）、搜索框、会话条目、主题切换。"""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFontMetrics
+from PyQt6.QtCore import (QEasingCurve, QPropertyAnimation, QSize, Qt,
+                          pyqtProperty, pyqtSignal)
+from PyQt6.QtGui import QColor, QFontMetrics, QPainter
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QScrollArea,
                              QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
 from ..core.models import Conversation
 from ..core.store import ChatStore
+from . import anim
 from .avatar import Avatar
+from . import flag_text
 from .icons import IconButton, make_icon
 from .theme import THEME_OPTIONS
 from .widgets import FloatingLabelInput, SegmentedControl
 
-__all__ = ["Sidebar", "ConversationItem", "SIDEBAR_WIDTH"]
+__all__ = ["Sidebar", "ConversationItem", "PopBadge", "SIDEBAR_WIDTH",
+           "SIDEBAR_MIN_WIDTH", "SIDEBAR_MAX_WIDTH"]
 
-SIDEBAR_WIDTH = 296
+SIDEBAR_WIDTH = 296          # 默认宽度
+SIDEBAR_MIN_WIDTH = 220      # 再窄摘要就只剩两个字了
+SIDEBAR_MAX_WIDTH = 460      # 再宽聊天区就不够用
 ITEM_HEIGHT = 66
+
+
+class PopBadge(QLabel):
+    """未读徽标：数字变化时"弹"一下。
+
+    自绘而不靠 QSS：只有自己画，才能既不触发重新布局、又能把缩放做在绘制阶段
+    （给布局里的控件动 geometry 会被布局立刻改回去）。缩放中心在正中，
+    所以"弹"的时候不会把旁边的摘要挤走。
+    """
+
+    POP_FROM = 0.62           # 从多小弹起
+    POP_MS = 320
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scale = 1.0
+        self._palette = None
+        self._bg = QColor("#3390EC")
+        self._fg = QColor("#FFFFFF")
+        self._anim = QPropertyAnimation(self, b"scale", self)
+        self._anim.setDuration(self.POP_MS)
+        self._anim.setStartValue(self.POP_FROM)
+        self._anim.setEndValue(1.0)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutBack)
+
+    def get_scale(self) -> float:
+        return self._scale
+
+    def set_scale(self, value: float) -> None:
+        self._scale = float(value)
+        self.update()
+
+    scale = pyqtProperty(float, fget=get_scale, fset=set_scale)
+
+    def pop(self) -> None:
+        """数字变多时弹一下（动画关掉时就是直接停在 1.0）。"""
+        self._anim.stop()
+        if not anim.is_enabled():
+            self.set_scale(1.0)
+            return
+        self.set_scale(self.POP_FROM)
+        self._anim.start()
+
+    def is_popping(self) -> bool:
+        return self._anim.state() == QPropertyAnimation.State.Running
+
+    def apply_palette(self, palette) -> None:
+        """记住调色板；具体颜色看 ``muted`` 属性（免打扰的徽标是灰的）。"""
+        self._palette = palette
+        self.refresh_colors()
+
+    def refresh_colors(self) -> None:
+        """按当前调色板 + ``muted`` 属性重取颜色（自绘，所以颜色得自己拿）。"""
+        if self._palette is None:
+            return
+        muted = self.property("muted") == "true"
+        background = self._palette.muted if muted else self._palette.accent
+        self.apply_colors(background, self._palette.accent_on)
+
+    def apply_colors(self, background: str, foreground: str) -> None:
+        self._bg = QColor(background)
+        self._fg = QColor(foreground)
+        self.update()
+
+    def paintEvent(self, event) -> None:                 # noqa: N802
+        base = QPainter(self)
+        base.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        width, height = self.width(), self.height()
+        base.translate(width / 2, height / 2)
+        base.scale(self._scale, self._scale)             # 以中心缩放：不挤走邻居
+        base.translate(-width / 2, -height / 2)
+        radius = min(width, height) / 2
+        base.setPen(Qt.PenStyle.NoPen)
+        base.setBrush(self._bg)
+        base.drawRoundedRect(self.rect(), radius, radius)
+        base.setPen(self._fg)
+        base.setFont(self.font())
+        base.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter), self.text())
+        base.end()
 
 
 class ConversationItem(QFrame):
     """一条会话：头像 + 名字/摘要 + 时间/未读徽标。"""
 
     clicked = pyqtSignal(str)
+    menuRequested = pyqtSignal(str, object)      # (会话id, 全局坐标) —— 右键菜单交给主窗口
 
     def __init__(self, conversation: Conversation, unread: int = 0, parent=None):
         super().__init__(parent)
+        self._muted = False
         self.setObjectName("convItem")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedHeight(ITEM_HEIGHT)
         self._selected = False
         self._preview_text = ""
+        self._draft = ""
 
         self.avatar = Avatar(self, size=46, name=conversation.title)
         self.name_label = QLabel(conversation.title, self)
@@ -42,15 +130,20 @@ class ConversationItem(QFrame):
         self.preview_label.setObjectName("convPreview")
         self.preview_label.setSizePolicy(QSizePolicy.Policy.Ignored,
                                          QSizePolicy.Policy.Preferred)
-        self.badge = QLabel("", self)
+        # 置顶/免打扰的小标记：放在名字和时间的中间，空着就不显示
+        self.mark_label = QLabel("", self)
+        self.mark_label.setObjectName("convMark")
+        self.badge = PopBadge(self)
         self.badge.setObjectName("badge")
         self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.badge.hide()
+        self._unread_shown = 0           # 上一次显示的数字，用来判断"是不是变多了"
 
         top = QHBoxLayout()
         top.setSpacing(6)
         top.addWidget(self.name_label)
         top.addStretch(1)
+        top.addWidget(self.mark_label)
         top.addWidget(self.time_label)
 
         bottom = QHBoxLayout()
@@ -82,16 +175,35 @@ class ConversationItem(QFrame):
         self._conversation_id = conversation.id
         self.name_label.setText(conversation.title)
         self.time_label.setText(conversation.preview_time())
-        self._preview_text = "正在输入…" if typing else conversation.preview_text()
+        if typing:
+            self._preview_text = "正在输入…"
+        elif self._draft:                    # 草稿优先于最后一条消息（Telegram 的做法）
+            self._preview_text = f"草稿：{self._draft}"
+        else:
+            self._preview_text = conversation.preview_text()
         self._elide_preview()
         others = [m for m in conversation.members if not m.is_me]
         self.avatar.set_name(conversation.title,
                              online=bool(others and others[0].online))
+        # 置顶/免打扰标记：📌 表示置顶，🔕 表示免打扰（两个都有就都显示）
+        marks = ("📌" if conversation.pinned else "") + ("🔕" if conversation.muted else "")
+        self.mark_label.setText(marks)
+        self.mark_label.setToolTip("置顶" if conversation.pinned else "")
+        if conversation.muted != self._muted:
+            self._muted = conversation.muted
+            # 免打扰的未读徽标是灰的（Telegram 同款），也不再弹跳，别来抢注意力
+            self.badge.setProperty("muted", "true" if self._muted else "false")
+            self.badge.refresh_colors()
         if unread > 0:
+            grew = self.isVisible() and unread > self._unread_shown
             self.badge.setText(str(unread) if unread < 100 else "99+")
             self.badge.show()
+            self._unread_shown = unread
+            if grew and not conversation.muted:
+                self.badge.pop()             # 数字变多才弹；首次铺列表不弹，免得太吵
         else:
             self.badge.hide()
+            self._unread_shown = 0
 
     def set_selected(self, selected: bool) -> None:
         if selected == self._selected:
@@ -103,8 +215,25 @@ class ConversationItem(QFrame):
         style.unpolish(self)
         style.polish(self)
 
+    def set_draft(self, text: str) -> None:
+        """这一行是不是还留着没发出去的草稿（会话列表里标出来）。"""
+        text = (text or "").strip()
+        if text == self._draft:
+            return
+        self._draft = text
+        self.preview_label.setProperty("draft", "true" if text else "false")
+        style = self.preview_label.style()
+        style.unpolish(self.preview_label)
+        style.polish(self.preview_label)
+
+    def draft(self) -> str:
+        return self._draft
+
     def apply_palette(self, palette) -> None:
         self.avatar.apply_palette(palette)
+        self._palette = palette
+        self.mark_label.setStyleSheet(f"color: {palette.muted};")
+        self.badge.apply_palette(palette)
 
     def preview_text(self) -> str:
         """未截断的摘要原文（测试与调试用）。"""
@@ -118,19 +247,31 @@ class ConversationItem(QFrame):
         """按当前宽度把摘要截成"…"结尾，避免半截字被硬切掉。"""
         metrics = QFontMetrics(self.preview_label.font())
         width = max(40, self.preview_label.width())
-        self.preview_label.setText(
-            metrics.elidedText(self._preview_text, Qt.TextElideMode.ElideRight, width))
+        text = self._preview_text
+        if self._draft and not text.startswith("草稿："):
+            text = f"草稿：{self._draft}"
+        elided = metrics.elidedText(text, Qt.TextElideMode.ElideRight, width)
+        # 先按纯文本截断（截断只认字符），再把旗帜换成小图
+        payload, rich = flag_text.to_display(elided, size=flag_text.PREVIEW_IMAGE_SIZE)
+        self.preview_label.setTextFormat(Qt.TextFormat.RichText if rich
+                                        else Qt.TextFormat.PlainText)
+        self.preview_label.setText(payload)
 
     def mousePressEvent(self, event) -> None:            # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self._conversation_id)
         super().mousePressEvent(event)
 
+    def contextMenuEvent(self, event) -> None:           # noqa: N802
+        """右键这一行 → 交给主窗口弹菜单（置顶/免打扰/标记未读/清空这个会话）。"""
+        self.menuRequested.emit(self._conversation_id, event.globalPos())
+
 
 class Sidebar(QWidget):
     """整个左栏。所有交互都通过信号抛给主窗口，自己不改数据。"""
 
     conversationSelected = pyqtSignal(str)
+    conversationMenuRequested = pyqtSignal(str, object)   # (会话id, 全局坐标)
     toolRequested = pyqtSignal()
     menuRequested = pyqtSignal()
     themeChanged = pyqtSignal(str)
@@ -139,12 +280,14 @@ class Sidebar(QWidget):
         super().__init__(parent)
         self.setObjectName("sidebar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # 宽度由主窗口经 setFixedWidth 控制（可拖动分界线改），这里只给默认值
         self.setFixedWidth(SIDEBAR_WIDTH)
         self._store = store
         self._items: dict[str, ConversationItem] = {}
         self._keyword = ""
         self._selected_id: str = ""
         self._typing: set[str] = set()
+        self._drafts: dict[str, str] = {}
         self._palette = None
         self._empty_hint: QLabel | None = None
 
@@ -248,7 +391,10 @@ class Sidebar(QWidget):
         for conv in conversations:
             item = ConversationItem(conv, self._store.unread(conv.id), self._list_host)
             item.clicked.connect(self.conversationSelected)
+            item.menuRequested.connect(self.conversationMenuRequested)
+            item.set_draft(self._drafts.get(conv.id, ""))
             item.set_selected(conv.id == self._selected_id)
+            item.refresh(conv, self._store.unread(conv.id), typing=conv.id in self._typing)
             item.show()                     # 后建的子控件不会自动显示
             self._list_layout.insertWidget(self._list_layout.count() - 1, item)
             self._items[conv.id] = item
@@ -278,12 +424,26 @@ class Sidebar(QWidget):
         self.refresh_total()
 
     def refresh_total(self) -> None:
-        total = self._store.total_unread()
+        total = self._store.total_unread()      # 免打扰的会话不计（在 store 里算，只有一份逻辑）
         if total > 0:
             self.total_badge.setText(str(total) if total < 100 else "99+")
             self.total_badge.show()
         else:
             self.total_badge.hide()
+
+    def set_drafts(self, drafts: dict[str, str]) -> None:
+        """草稿表 ``{会话id: 草稿文本}``（主窗口在切会话时更新）。"""
+        self._drafts = dict(drafts)
+        for conversation_id, item in self._items.items():
+            conversation = self._store.get(conversation_id)
+            if conversation is None:
+                continue
+            item.set_draft(self._drafts.get(conversation_id, ""))
+            item.refresh(conversation, self._store.unread(conversation_id),
+                         typing=conversation_id in self._typing)
+
+    def drafts(self) -> dict[str, str]:
+        return dict(self._drafts)
 
     def set_current(self, conversation_id: str) -> None:
         self._selected_id = conversation_id

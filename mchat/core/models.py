@@ -128,6 +128,7 @@ class Conversation:
     members: list[User] = field(default_factory=list)
     messages: list[Message] = field(default_factory=list)
     pinned: bool = False
+    muted: bool = False          # 免打扰：未读不计数、徽标变灰（侧栏右键菜单里切）
 
     # ---------------------------------------------------------------- 查询
     @property

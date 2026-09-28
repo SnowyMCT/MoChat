@@ -125,6 +125,27 @@ def watch_system_palette(callback) -> None:
         signal.connect(lambda *_: callback())
 
 
+def menu_qss(p: Palette) -> str:
+    """右键/下拉菜单的样式（菜单是独立顶层控件，不吃主窗口的样式表）。"""
+    return f"""
+    QMenu {{
+        background-color: {p.card};
+        border: 1px solid {p.border};
+        border-radius: 10px;
+        padding: 6px;
+    }}
+    QMenu::item {{
+        padding: 7px 18px 7px 14px;
+        border-radius: 8px;
+        color: {p.text};
+        font-size: 12.5px;
+    }}
+    QMenu::item:selected {{ background-color: {p.accent_soft}; color: {p.accent}; }}
+    QMenu::item:disabled {{ color: {p.muted}; }}
+    QMenu::separator {{ height: 1px; background: {p.border}; margin: 5px 8px; }}
+    """
+
+
 def build_qss(p: Palette) -> str:
     """生成整套静态样式表。"""
     return f"""
@@ -133,9 +154,10 @@ def build_qss(p: Palette) -> str:
 
     /* ---------------------------------------------------------- 骨架 -- */
     QWidget#root {{ background-color: {p.surface}; }}
+    /* 侧栏与聊天区之间的竖线不在这里画：由 SplitHandle 自绘，
+       这样拖动时线能跟着高亮/变粗，也不用让两个控件各自画半条 */
     QWidget#sidebar {{
         background-color: {p.sidebar};
-        border-right: 1px solid {p.border};
     }}
     QWidget#chatHeader {{
         background-color: {p.card};
@@ -160,6 +182,9 @@ def build_qss(p: Palette) -> str:
         background-color: {p.accent}; color: {p.accent_on};
         font-size: 11px; font-weight: 700;
         border-radius: 10px; padding: 1px 7px;
+    }}
+    QLabel#convMark {{
+        font-size: 11px; padding: 0 2px;
     }}
     QLabel#sideSectionTitle {{
         font-size: 11px; font-weight: 700; color: {p.muted};
@@ -197,10 +222,42 @@ def build_qss(p: Palette) -> str:
     QLabel#emptyTitle {{ font-size: 16px; font-weight: 700; color: {p.text}; }}
     QLabel#emptyText {{ font-size: 12.5px; color: {p.muted}; }}
 
+    /* 表情回应：点一下加/撤，自己点过的高亮 */
+    QLabel#reactionChip {{
+        background-color: {p.track};
+        border: 1px solid transparent;
+        border-radius: 10px;
+        font-size: 11.5px;
+        padding: 1px 7px;
+    }}
+    QLabel#reactionChip:hover {{ border-color: {p.accent}; }}
+    QLabel#reactionChip[mine="true"] {{
+        background-color: {p.accent_soft};
+        border-color: {p.accent};
+    }}
+    /* 跳到某条消息时闪一下边框（动态属性 + repolish） */
+    QFrame#bubbleIn[flash="true"], QFrame#bubbleOut[flash="true"] {{
+        border: 2px solid {p.accent};
+    }}
+    /* 会话列表里未发出去的草稿 */
+    QLabel#convPreview[draft="true"] {{ color: {p.danger}; font-weight: 600; }}
+
+    /* ---------------------------------------------------- 搜索窗口 -- */
+    QWidget#searchRoot {{ background-color: {p.surface}; }}
+    /* 滚动区不写这两行的话，视口会退回系统默认底色（暗色主题下露出一片浅灰） */
+    QScrollArea#searchArea {{ background: transparent; border: none; }}
+    QScrollArea#searchArea > QWidget > QWidget {{ background-color: {p.surface}; }}
+    QWidget#searchRow {{ background-color: {p.card}; border-radius: 10px; }}
+    QWidget#searchRow[selected="true"] {{ background-color: {p.item_selected}; }}
+    QLabel#searchTitle {{ font-size: 12.5px; font-weight: 700; color: {p.text}; }}
+    QLabel#searchSnippet {{ font-size: 12px; color: {p.muted}; }}
+    QLabel#searchTime {{ font-size: 11px; color: {p.muted}; }}
+    QLabel#searchHint {{ font-size: 12px; color: {p.muted}; }}
+
     /* ------------------------------------------------------ 输入栏 -- */
     /* color 必须写：只写背景的话，QSS 会退回系统默认调色板，
        暗色主题下输入框里的字就是黑的，落在深色底上根本看不见 */
-    QPlainTextEdit#composerInput {{
+    QTextEdit#composerInput {{
         background: transparent;
         border: none;
         color: {p.text};
@@ -209,6 +266,33 @@ def build_qss(p: Palette) -> str:
         font-size: 13.5px;
         padding: 0px;
     }}
+
+    /* ---------------------------------------------------- 表情面板 -- */
+    QWidget#emojiPanel {{
+        background-color: {p.card};
+        border-top: 1px solid {p.border};
+    }}
+    QScrollArea#emojiArea {{ background: transparent; border: none; }}
+    QScrollArea#emojiArea > QWidget > QWidget {{ background-color: {p.card}; }}
+    QToolButton#emojiCell {{
+        background: transparent;
+        border: none;
+        border-radius: 9px;
+        color: {p.text};
+        padding: 0px;
+    }}
+    QToolButton#emojiCell:hover {{ background-color: {p.track}; }}
+    QToolButton#emojiCell:pressed {{ background-color: {p.border}; }}
+    QToolButton#emojiCatBtn {{
+        background: transparent;
+        border: none;
+        border-radius: 8px;
+        color: {p.muted};
+        padding: 0px;
+    }}
+    QToolButton#emojiCatBtn:hover {{ background-color: {p.track}; }}
+    QToolButton#emojiCatBtn:checked {{ background-color: {p.accent_soft}; }}
+    QLabel#emojiHint {{ font-size: 12.5px; color: {p.muted}; }}
 
     /* ------------------------------------------------------ 工具箱 -- */
     QWidget#toolRoot {{ background-color: {p.surface}; }}
@@ -253,6 +337,7 @@ def build_qss(p: Palette) -> str:
     }}
     QToolButton#iconBtn:hover {{ background-color: {p.track}; }}
     QToolButton#iconBtn:pressed {{ background-color: {p.border}; }}
+    QToolButton#iconBtn:checked {{ background-color: {p.accent_soft}; }}
 
     QToolButton#toolBtn {{
         background-color: {p.accent_soft};

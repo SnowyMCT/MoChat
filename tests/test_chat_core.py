@@ -311,6 +311,79 @@ def test_seed_scripts_cover_conversations():
 # ---------------------------------------------------------------------------
 # 自写 runner：不装 pytest 也能一条命令跑完
 # ---------------------------------------------------------------------------
+def _conv(conv_id: str = "c1", texts=()) -> Conversation:
+    conv = Conversation(id=conv_id, title="测试会话", kind=ChatKind.DIRECT,
+                        members=[_user("我", "me"), _user("对方", "other")])
+    conv.messages.extend(_message(conv_id, text, ts, mid=mid)
+                         for text, ts, mid in texts)
+    return conv
+
+
+def test_hydrate_merges_sorts_and_counts_new():
+    """回填：按时间排好、同 id 保留更新鲜的那份、返回值只数"新来的"。"""
+    store = ChatStore([_conv("c1", [("旧的一", 100.0, "m1"), ("旧二", 200.0, "m2")])])
+    added = store.hydrate("c1", [
+        _message("c1", "更早的", 50.0, mid="m0"),
+        _message("c1", "历史里的旧二", 150.0, mid="m2"),      # 同 id 但更旧 -> 不用
+        _message("c1", "新的", 300.0, mid="m3"),
+    ])
+    assert added == 2, added
+    assert [m.id for m in store.get("c1").messages] == ["m0", "m1", "m2", "m3"]
+    assert store.get("c1").messages[1].text == "旧的一"
+
+
+def test_hydrate_replaces_when_history_is_newer():
+    store = ChatStore([_conv("c1", [("内存里的", 100.0, "m1")])])
+    store.hydrate("c1", [_message("c1", "库里更新的", 500.0, mid="m1")])
+    assert store.get("c1").messages[0].text == "库里更新的"
+
+
+def test_hydrate_unknown_conversation_is_noop():
+    store = ChatStore([_conv("c1")])
+    assert store.hydrate("没有这个会话", [_message("x", "hi", 1.0, mid="mx")]) == 0
+
+
+def test_remove_message():
+    store = ChatStore([_conv("c1", [("一", 1.0, "m1"), ("二", 2.0, "m2")])])
+    assert store.remove("m1") is True
+    assert [m.id for m in store.get("c1").messages] == ["m2"]
+    assert store.remove("m1") is False                     # 再删就没有了
+    assert store.remove("压根不存在") is False
+
+
+def test_set_pinned_and_muted():
+    store = ChatStore([_conv("c1", [("一", 1.0, "m1")]), _conv("c2", [("二", 2.0, "m2")])])
+    assert [c.id for c in store.conversations()] == ["c2", "c1"]     # 按最近消息排序
+    assert store.set_pinned("c1", True) is True
+    assert [c.id for c in store.conversations()] == ["c1", "c2"]     # 置顶的排前面
+    assert store.set_pinned("c1", True) is False                     # 状态没变就不发事件
+    assert store.set_pinned("不存在", True) is False
+    assert store.set_muted("c2", True) is True
+    assert store.get("c2").muted is True
+    assert store.set_muted("c2", False) is True
+
+
+def test_total_unread_skips_muted():
+    store = ChatStore([_conv("c1", [("一", 1.0, "m1")]), _conv("c2", [("二", 2.0, "m2")])])
+    store.set_unread("c1", 2)
+    store.set_unread("c2", 3)
+    assert store.total_unread() == 5
+    store.set_muted("c2", True)
+    assert store.total_unread() == 2, "免打扰的会话不该计进顶部徽标"
+    assert store.unread("c2") == 3, "但它自己的未读数还在"
+
+
+def test_clear_messages_only_one_conversation():
+    store = ChatStore([_conv("c1", [("一", 1.0, "m1"), ("二", 2.0, "m2")]),
+                       _conv("c2", [("三", 3.0, "m3")])])
+    store.set_unread("c1", 4)
+    assert store.clear_messages("c1") == 2
+    assert store.get("c1").messages == []            # 这个会话空了
+    assert store.unread("c1") == 0
+    assert len(store.get("c2").messages) == 1        # 别的会话纹丝不动
+    assert store.clear_messages("不存在") == 0
+
+
 def _run_all() -> int:
     tests = [(name, obj) for name, obj in sorted(globals().items())
              if name.startswith("test_") and callable(obj)]

@@ -6,6 +6,13 @@ __pycache__/
 # 测试产出的截图
 artifacts/
 
+# 旗帜构建脚本的下载缓存（素材本身已提交为 mchat/assets/flags.png）
+.flag_cache/
+
+# 打包产物
+build/
+dist/
+
 # 编辑器
 .idea/workspace.xml
 .idea/shelf/
