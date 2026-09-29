@@ -67,6 +67,20 @@ def _plus(painter: QPainter, color: QColor) -> None:
     painter.drawLine(QPointF(0.5, 0.16), QPointF(0.5, 0.84))
 
 
+def _exit(painter: QPainter, color: QColor) -> None:
+    """退出登录：一扇门 + 一支往外走的箭头（比一个"电源"图标更像"退出账号"）。"""
+    _pen(painter, color, 0.095)
+    path = QPainterPath()                      # 门框：左边、上边、下边（右侧开口）
+    path.moveTo(0.54, 0.14)
+    path.lineTo(0.20, 0.14)
+    path.lineTo(0.20, 0.86)
+    path.lineTo(0.54, 0.86)
+    painter.drawPath(path)
+    painter.drawLine(QPointF(0.40, 0.50), QPointF(0.86, 0.50))     # 箭头杆
+    painter.drawLine(QPointF(0.68, 0.32), QPointF(0.86, 0.50))     # 箭头两撇
+    painter.drawLine(QPointF(0.68, 0.68), QPointF(0.86, 0.50))
+
+
 def _smile(painter: QPainter, color: QColor) -> None:
     _pen(painter, color, 0.08)
     painter.drawEllipse(QPointF(0.5, 0.5), 0.39, 0.39)
@@ -163,6 +177,7 @@ _PAINTERS = {
     "send": _send,
     "apps": _apps,
     "plus": _plus,
+    "exit": _exit,
     "smile": _smile,
     "check": _check,
     "double_check": _double_check,

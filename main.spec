@@ -5,11 +5,9 @@
     pyinstaller main.spec              # 等价，手动跑
 
 **别删 datas**：`datas=[('mchat/assets', 'mchat/assets')]` 是本地素材的唯一来源 ——
-旗帜精灵图 + 逐张 PNG，以及演示附件（`assets/demo/` 里的那张图片和那个 PDF）。少了它：
-
-* 冻结后 `flags.sprite_exists()/png_exists()` 全假，界面整体降级成纯文本 ——
-  Windows 的 Segoe UI Emoji 不画国旗，于是旗帜全变成 "CN" "JP" 两个字母；
-* 演示数据里的图片/文件消息找不到文件，气泡显示成"图片不在本地了"。
+旗帜精灵图 + 逐张 PNG（`assets/demo/` 里那两张附件素材现在只给测试用，一并带上无妨）。
+少了它：冻结后 `flags.sprite_exists()/png_exists()` 全假，界面整体降级成纯文本 ——
+Windows 的 Segoe UI Emoji 不画国旗，于是旗帜全变成 "CN" "JP" 两个字母。
 
 （同理：别再用 `pyinstaller -F -w main.py` 直接打包 —— 那条命令不带任何 data 文件，
 PyInstaller 还会顺手把本文件重写成 `datas=[]` 的默认版。）

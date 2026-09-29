@@ -417,6 +417,17 @@ def build_qss(p: Palette, *, scale: float | None = None) -> str:
     QLabel#cardTitle {{ font-size: 13px; font-weight: 700; color: {p.text}; }}
     QLabel#hint {{ font-size: 11px; color: {p.muted}; }}
 
+    /* ---------------------------------------------------- 登录窗口 -- */
+    /* 状态行 / 用户行（新建会话）—— 登录窗口整窗用 build_qss，自带卡片与主按钮样式 */
+    QLabel#loginStatus {{ font-size: 12px; color: {p.muted}; }}
+    QWidget#userRow {{ background-color: {p.card}; border-radius: 10px; }}
+    QWidget#userRow:hover {{ background-color: {p.item_selected}; }}
+    QWidget#userRow[selected="true"] {{ background-color: {p.accent_soft}; }}
+    QLabel#userName {{ font-size: 13.5px; font-weight: 600; color: {p.text}; }}
+    QLabel#userHandle {{ font-size: 11.5px; color: {p.muted}; }}
+    QLabel#dialogHint {{ font-size: 12px; color: {p.muted}; }}
+    QLabel#dialogStatus {{ font-size: 12px; color: {p.muted}; }}
+
     /* -------------------------------------------------------- 按钮 -- */
     QPushButton#primary {{
         background-color: {p.accent};

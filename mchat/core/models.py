@@ -101,9 +101,15 @@ def human_size(size: int) -> str:
 class Attachment:
     """消息里的附件。
 
-    单机演示没有服务器，所以**只记本地路径**，不搬文件、不上传（真联网时这一层要换成
-    "先上传拿到远端 id，再随消息发出"）。真正跨进程传输的三个字段是
-    ``path`` / ``name`` / ``size``：落库时序列化成 JSON 存一列，读回来原样还原。
+    联网之后一个附件有**两种状态**，靠 ``path`` 区分：
+
+    * 已经在本地磁盘上 —— ``path`` 是真实路径，点开就用系统程序打开；
+    * 还在服务器上、没下回来 —— ``path`` 是 ``remote://<附件id>`` 这个**标记**
+      （见 :attr:`is_remote`）。气泡照样显示名字和大小，"点开"时再按 id 去下载。
+
+    为什么用"标记路径"而不是加一个字段：数据层（库、传输层、气泡）全都只认
+    ``path/name/size`` 这三样，加标记就不用动数据库结构，也不用动任何一层的形状 ——
+    "下载到本地"这一步做完以后，附件就和"本机选的图片"完全一样了。
 
     ``name`` 和 ``size`` 都可以从路径推出来，但显式存下来更稳：文件被移走/改名以后，
     气泡上的文件卡片还能显示原来的名字和大小（不会变成"未知"）。
@@ -112,6 +118,7 @@ class Attachment:
     path: str
     name: str = ""
     size: int = 0
+    REMOTE_SCHEME = "remote://"          # 远程附件在 ``path`` 里的标记前缀
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -128,7 +135,22 @@ class Attachment:
         """从本地路径造一个附件（绝对路径：存进库里的路径要经得起换 cwd）。"""
         return cls(path=os.path.abspath(str(path)))
 
+    @classmethod
+    def remote(cls, file_id: str, name: str = "", size: int = 0) -> "Attachment":
+        """造一个"还在服务器上"的附件（下载完请用 :meth:`from_path` 换掉它）。"""
+        return cls(path=cls.REMOTE_SCHEME + str(file_id), name=name, size=size)
+
     # ---------------------------------------------------------------- 查询
+    @property
+    def is_remote(self) -> bool:
+        """是不是"还没下载到本地"（气泡点开时要先去服务端拿）。"""
+        return self.path.startswith(self.REMOTE_SCHEME)
+
+    @property
+    def remote_id(self) -> str:
+        """服务器上的附件 id；本地附件就是空串。"""
+        return self.path[len(self.REMOTE_SCHEME):] if self.is_remote else ""
+
     @property
     def suffix(self) -> str:
         """``.pdf`` / ``.png``（全是小写，没有后缀就是空串）。"""
@@ -160,8 +182,11 @@ class Attachment:
 
     @property
     def exists(self) -> bool:
-        """文件还在不在本地（被删/被移走时界面要能优雅降级）。"""
-        return bool(self.path) and os.path.isfile(self.path)
+        """文件还在不在本地（被删/被移走时界面要能优雅降级）。
+
+        远程附件**恒为 False**：界面会走"点一下去下载"的分支，而不是"打开文件"。
+        """
+        return bool(self.path) and not self.is_remote and os.path.isfile(self.path)
 
     # ---------------------------------------------------------------- 序列化
     def to_json(self) -> dict:

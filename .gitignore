@@ -13,6 +13,9 @@ artifacts/
 build/
 dist/
 
+# 服务端本地数据（sqlite + 上传的附件）—— 部署时临时生成，不进仓库
+server/data/
+
 # 编辑器
 .idea/workspace.xml
 .idea/shelf/

@@ -1,12 +1,36 @@
 # MChat
 
-一个 Telegram 风格的桌面聊天软件。当前是**本机演示**版：界面完整、消息能收能发，
-"对方"由脚本自动回复，**还没有联网**（传输层接口已经留好，见下）。
+一个 Telegram 风格的**联网**桌面聊天软件：有账号系统、有服务端、消息真的从一台电脑
+走到另一台电脑。界面（气泡、表情面板、附件、回复/转发、置顶、搜索、动效）照旧，
+但底下已经不是"脚本自动回复"了。
+
+* **账号**：注册 / 登录 / 退出登录；登录信息**缓存在本地**，下次打开直接进主界面
+  （和 Telegram 一样：登一次就够了）。缓存里存的是**令牌**，不存密码。
+* **服务端**：`server/` 目录是完整可部署的服务端（**纯 Python 标准库**，零第三方依赖），
+  拷到服务器上 `python3 mchat_server.py` 就能跑；部署细节见 `server/README.md`、
+  协议见 `server/PROTOCOL.md`。
+* **真聊天**：消息、未读、已读回执、正在输入、图片/文件附件都走服务端，
+  多设备（同一账号两处登录）也能同步；掉线了消息**攒着**，联网自动补发。
+* **没有演示会话了**：以前打开就有的那五个假会话（王尼玛、天下尼玛是一家…）**全部删掉**，
+  现在打开是空的，会话由你自己在服务端上建（左栏「＋」找人开聊 / 建群）。
+  （那些示例数据搬到了 `tests/seed.py`，只服务于回归测试，不会出现在程序里。）
 
 原来那套 **Base64 / AES-256 安全文本转换器**收进了聊天窗口左上角的 **「工具箱」** 按钮
 （快捷键 `Ctrl+T`），当一个小功能保留下来，交互和动效一点没丢。
 
 ## 运行
+
+### 1. 先起服务端（自己电脑上试就直接跑本机）
+
+```bash
+# 本机自测（数据落在 server/data/）
+.venv/Scripts/python.exe server/mchat_server.py --host 127.0.0.1 --port 8765
+
+# 服务器上（部署到公网见 server/README.md：systemd / 防火墙 / HTTPS 反代）
+python3 server/mchat_server.py --host 0.0.0.0 --port 8765 --data /var/lib/mchat
+```
+
+### 2. 再开客户端并登录
 
 ```bash
 # 方式一：项目自带 venv（依赖已装好）
@@ -16,16 +40,32 @@
 uv run main.py
 ```
 
+启动时：**本地有登录令牌就直接进聊天窗口**（并顺手向服务端确认一次令牌还有效）；
+没有（第一次用、或刚点过退出登录）就显示**登录窗口** —— 填服务器地址
+（本机就是 `http://127.0.0.1:8765`）、点「注册」建个号，或者用已有账号「登录」。
+勾着「记住我」（默认）就把令牌写进 `%APPDATA%\MChat\MChat\account.json`，
+下次不用再登。想换账号：左栏底部那行「账号 · 已连接」右边的**退出图标**。
+
+两个人要真的聊起来：**两台机器都填同一个服务器地址**，各自注册一个账号，
+其中一个在左栏「＋」里搜对方的用户名，点一下就能开聊（对方那边会话会自动出现）。
+
 ## 界面长什么样
 
 - **左栏**：会话列表（头像 + 名字 + 摘要 + 时间 + 未读徽标）、搜索框、主题切换。
   置顶会话排在最前（名字后面标 📌），摘要按宽度自动省略号截断。
   **在会话上点右键**可以置顶 / 免打扰 / 标记为未读 / 清空这个会话的历史（见下）。
+- **左栏头部那几个按钮**：「工具箱」（原转换器）、**「＋」新建会话**（搜人开单聊 / 勾人建群）、
+  「齿轮」设置。**左栏底部**是主题切换 + 一行状态小字（`账号名 · 已连接 · host`，
+  掉线时变成 `离线，N 条待发 · 正在重连 host`）+ 一个**退出登录**图标（点它会二次确认）。
+- **第一屏是登录**：没有本地登录缓存时先出登录/注册窗口；有缓存直接进主界面。
+- **一开始是空的**（没有任何演示会话）：点「＋」找人开聊，或者让对方先给你发消息
+  —— 新会话会自己冒出来（服务端推的）。
 - **右栏**：聊天头部（头像、名字、"在线 / N 位成员 / 正在输入…"）、消息区（气泡 + 日期分隔条）、
   输入栏（表情、自动增高输入框、发送按钮）。
 - **发出**的消息靠右（亮色主题是 Telegram 那种浅绿气泡，暗色是深蓝），带头上的 ✓ / 已读 ✓✓；
   **收到**的消息靠左，群里还会显示发送者名字。
-- 打开就是"今天 / 昨天"的真实时间线（演示数据的时间戳相对"现在"生成，不会过期）。
+- 打开一个会话会先显示本地缓存的历史（**断网也能翻**），再从服务端补最新的
+  —— 时间线是"今天 / 昨天"的真实日期分隔。
 - 主题：亮色 / 暗色 / 跟随系统，选择会被记住。
 - **分界线**：左右两栏之间那条竖线可以直接拖动，改会话列表的宽度（220–460px，窗口变窄时
   上限会自动让步，保证聊天区不被挤没）；鼠标悬停/拖动时竖线会高亮变粗，**双击还原默认 296px**，
@@ -277,14 +317,20 @@ chats.pinned_message_id 会话内置顶的 **[{"id":..,"both":..}, ...]**（JSON
 main.py                     启动入口
 mchat/app.py                入口转出（兼容 from mchat.app import main）
 mchat/core/                 纯逻辑层，零 Qt 依赖
+    api.py                  服务端 HTTP 客户端 + 线上 JSON → 模型的转换（唯一知道协议的地方）
+    session.py              账号登录态的本地缓存（令牌 / 多账号 / 每个账号一个库文件）
+    net_transport.py        真联网的传输层：长轮询收、发件箱发、掉线重发、附件上传下载
     crypto.py               Base64 + AES-256-CBC（原 mchat.crypto）
-    db.py                   本地历史：SQLite + FTS5（消息/附件/回应/草稿/会话旗标）
+    db.py                   本地历史：SQLite + FTS5（消息/附件/回应/草稿/会话旗标/清空点）
     models.py               User / Message / Conversation / Attachment + 时间文案
-    assets.py               本地素材（演示附件）的路径解析（冻结感知）
+    assets.py               本地素材（旗帜/演示附件）的路径解析（冻结感知）
     store.py                会话仓库：排序、未读、搜索、变更订阅
-    transport.py            传输层接口 ChatTransport + 单机演示实现 LocalTransport
-    seed.py                 演示会话、自动回复台词、演示附件
+    transport.py            传输层接口 ChatTransport（+ 本机演示实现与空实现）
 mchat/ui/                   界面层
+    launcher.py             启动流程：缓存自动登录 → 主窗口 / 登录窗口；退出登录也在这里
+    login_window.py         登录 / 注册窗口（服务器地址、用户名、密码、记住我、测试连接）
+    new_chat_dialog.py      新建会话：搜人开单聊 / 勾人建群
+    async_call.py           把网络调用扔到后台线程、结果回主线程（Qt 信号，线程安全）
     theme.py                颜色令牌（亮/暗）+ 全局 QSS + **文字大小（字号缩放）**
     icons.py                用 QPainter 现画的矢量图标（无图片资源）
     avatar.py               圆形渐变头像
@@ -302,14 +348,22 @@ mchat/ui/                   界面层
     sidebar.py              左栏：会话条目（含右键菜单回调）、搜索、工具箱与设置入口、主题切换
     chat_view.py            右栏：气泡（附件/引用/转发卡片/勾选）、消息列表、批量条、输入栏
     security_tool.py        安全工具箱（面板 + 对话框包装）
-    main_window.py          主窗口：接线、主题、事件轮询、附件动作、设置
+    main_window.py          主窗口：接线、主题、事件轮询、跟服务端对账、附件动作、设置
+server/                     服务端（**纯标准库，零依赖**，整个目录拷到服务器就能跑）
+    mchat_server.py         服务端本体：账号 / 会话 / 消息 / 长轮询 / 附件
+    PROTOCOL.md             协议契约（客户端与服务端都按它实现）
+    README.md               部署文档（systemd / 防火墙 / HTTPS 反代 / 备份）
+    mchat-server.service    systemd 单元文件
+    run.bat                 Windows 上双击就能跑
+    selftest.py             服务端自检（193 项，起真进程跑完整流程）
 assets/flags.png            旗帜精灵图（本地素材，随包分发；生成物）
 assets/flags/*.png          逐张旗帜 PNG（消息文本 <img> 用；生成物）
-assets/demo/配色预览.png      演示图片消息的素材（生成物，随包分发）
-assets/demo/评审材料-v3.pdf   演示文件消息的素材（生成物，随包分发）
+assets/demo/                两张演示附件素材（只给测试用，程序里不再引用）
 tools/build_flags.py        生成 flags.png + flags.py 的构建脚本（唯一联网的一步）
 tools/build_demo_assets.py  生成演示附件素材（QPainter 现画 + 手写最小 PDF，不联网）
-tests/                      十套测试，共 630 项断言
+tests/                      13 套测试 / 718 项断言（见下面的「测试」一节）
+tests/seed.py               示例会话与自动回复台词（**只给测试用**，程序里不引用）
+tests/server_fixture.py     起一个真服务端给测试用（随机端口 + 临时数据目录）
 ```
 
 减少重复的做法：会话条目、气泡、输入栏、工具箱都只有一份实现；文案与规则集中在
@@ -318,18 +372,28 @@ tests/                      十套测试，共 630 项断言
 ## 本地历史 / 搜索 / 互动（`mchat/core/db.py`）
 
 聊天记录落在**一个 SQLite 文件**里（`sqlite3` 是标准库，引擎与 FTS5 索引都是原生 C），
-位置跟着系统走 —— Windows 是 `%APPDATA%\MChat\...\mchat.db`，设置区域里的「打开数据目录」
-可以直接跳过去。程序运行期间**不开网络**，也不需要任何服务。
+位置跟着系统走 —— Windows 是 `%APPDATA%\MChat\MChat\mchat-<用户名>@<服务器>.db`
+（**一个账号一个文件**：换个账号登录绝不会看到上一个账号的记录），
+设置区域里的「打开数据目录」可以直接跳过去。
+
+联网之后它仍然是**本地缓存**：真正的权威是服务端，本地库负责"打开就能看历史、断网也能翻"。
+服务端拉回来的每一条都会顺手落库，所以搜索（FTS5）在离线时照样好使。
 
 ```
 messages   消息正文（id 主键，conversation_id + ts 有索引）
            attachment  附件的 JSON（path/name/size），没有就是 NULL
+                       —— 联网收到的附件可能是 "remote://<附件id>"（还没下到本地）
            file_name   附件文件名（单独一列，给下面的生成列用）
            search_text VIRTUAL 生成列 = 正文 + 文件名 —— FTS 索引的就是它
 messages_fts  FTS5 trigram 索引（external content，索引列 search_text，正文不存两遍）
 reactions  表情回应（message_id + emoji，记 count 与"是不是我点的"）
 drafts     草稿（conversation_id 主键，空串即删除）
+chats      会话旗标：置顶 / 免打扰 / 清空过 / 会话内置顶的消息 / **清空时间点**
 ```
+
+`chats.cleared_at` 是给联网版加的（schema v4）：清空一个会话只是删**本地**这份记录，
+服务端那边消息还在 —— 没有这个时间戳的话，下次打开这个会话会把旧消息**再拉回来一次**，
+用户会觉得"我删了它又自己长回来了"。记住"清到哪一刻"，比它更早的消息一律不再显示。
 
 几个刻意的取舍：
 
@@ -429,22 +493,32 @@ drafts     草稿（conversation_id 主键，空串即删除）
    回调里再碰控件，PyQt6 会把 `RuntimeError` 升级成**进程级崩溃**（实测踩过一次，
    清空历史/刷新搜索结果时必现）。
 
-## 怎么接真网络
+## 真网络是怎么接上去的
 
-界面只依赖传输层的三个动作，换成 socket 实现即可，**ui 一行都不用改**：
+界面只依赖传输层的三个动作（`start` / `send` / `poll`），所以"联网"这件事被完整地关在
+**一个实现类**里，ui 一行都没改：
 
 ```python
-class ChatTransport(abc.ABC):          # mchat/core/transport.py
+class ChatTransport(abc.ABC):              # mchat/core/transport.py
     def start(self) -> None: ...
     def send(self, message: Outgoing) -> None: ...
     def poll(self, now: float | None = None) -> list[TransportEvent]: ...
 ```
 
-- 现在的 `LocalTransport`：`send()` 排一个"正在输入… → 台词回复 → 已读回执"的事件队列，
-  `poll()` 把到期的倒出来（用时间戳判断，测试里可以注入假时钟，不用真等）；
-- 将来的 `SocketTransport`：`send()` 写 socket，`poll()` 读 socket 并解析成同样的事件。
-- 主窗口每 400ms 调一次 `tick()`，把事件喂给 `ChatStore`，界面靠订阅刷新 —— 这条链路不用动。
-- `ChatStore` 内部有锁，网络线程直接 append 也是安全的。
+- `NetworkTransport`（`mchat/core/net_transport.py`，真机用的就是这个）：
+  `send()` 把消息丢进**发件箱**立刻返回，一条后台线程负责发送 + 长轮询收事件，
+  `poll()` 把收到的事件倒给界面 —— 形状和本机演示那个 `LocalTransport` 一模一样；
+- 三条必须在联网实现里做对的事：**掉线重发**（消息不丢，重发用同一个 id，服务端幂等，
+  不会变成两条）、**断线自动重连**（1s → 2s → 5s 退避）、
+  **附件先上传再发**（收到时下到本地缓存，下不动就留着"点一下重试"）；
+- 主窗口每 400ms 调一次 `tick()`，把事件喂给 `ChatStore`，界面靠订阅刷新 —— 这条链路没动。
+  `ChatStore` 内部有锁，网络线程直接 append 也是安全的；
+- 登录、拉会话、拉历史、已读回执这些一次性请求走 `mchat/ui/async_call.py`：
+  后台线程发请求、**Qt 信号**把结果排队送回主线程（不能直接回调 —— 那等于在后台线程碰界面）。
+
+服务的另一头是 `server/mchat_server.py`：**纯 Python 标准库**写的一个 HTTP 服务，
+用长轮询（`/api/sync`）做实时推送。协议见 `server/PROTOCOL.md`，
+部署见 `server/README.md`。它能部署在服务器上，也可以就跑在你自己电脑上（局域网/本机自测）。
 
 ## 打包成 exe
 
@@ -497,7 +571,7 @@ dist/frozen_check.exe --shot artifacts/frozen_flags.png
 ## 测试
 
 ```bash
-# 规范命令：一条跑完全部十套（630 项断言）
+# 规范命令：一条跑完全部 13 套（718 项断言；端到端那套会真起服务端，要十几秒）
 .venv/Scripts/python.exe -m pytest tests -q
 
 # 也可以逐套直接跑（不依赖 pytest，会打印每项结果并生成截图）
@@ -505,13 +579,26 @@ dist/frozen_check.exe --shot artifacts/frozen_flags.png
 .venv/Scripts/python.exe tests/test_chat_core.py       # 核心逻辑 37 项（零 Qt；含回复/多条置顶两种范围/转发/批量删除）
 .venv/Scripts/python.exe tests/test_db.py              # 本地历史/检索/附件/回复转发/置顶与迁移 34 项（零 Qt）
 .venv/Scripts/python.exe tests/test_attachments.py     # 附件模型/传输/演示素材 14 项（零 Qt）
+.venv/Scripts/python.exe tests/test_account.py         # 账号缓存 + 线上 JSON → 模型 23 项（零 Qt）
+.venv/Scripts/python.exe tests/test_net.py             # 网络传输层（发件箱/重试/长轮询/附件）16 项
+.venv/Scripts/python.exe tests/test_server.py          # **端到端**：真起服务端，两个界面窗口互发消息 4 项
 .venv/Scripts/python.exe tests/test_settings.py        # 字号缩放/档位表/样式表 8 项（不需要窗口）
 .venv/Scripts/python.exe tests/test_emoji.py           # 表情数据与搜索 14 项（零 Qt）
 .venv/Scripts/python.exe tests/test_flags.py           # 旗帜数据/素材/搜索/打包 21 项（零 Qt）
 .venv/Scripts/python.exe tests/test_flag_text.py       # 旗帜文本渲染 14 项（零 Qt）
 .venv/Scripts/python.exe tests/test_security_tool.py   # 工具箱界面 53 项（含切方式保留输入）
-.venv/Scripts/python.exe tests/test_ui.py              # 聊天界面端到端 422 项（含动效/滚动/右键菜单/附件/设置/批量操作）
+.venv/Scripts/python.exe tests/test_ui.py              # 聊天界面端到端 465 项（含动效/滚动/右键菜单/附件/设置/批量操作）
+
+# 服务端自己的自检（起真进程，193 项：账号/会话/消息/长轮询/附件/限额/优雅退出）
+.venv/Scripts/python.exe server/selftest.py
 ```
+
+`tests/test_server.py` 是"它到底能不能用"的那一套：用 `tests/server_fixture.py` 在**随机端口**
+起一个**真的服务端**（临时数据目录，退出即删），然后
+①用 API 客户端走完账号/消息/附件/群聊/分页/幂等；②**开两个真实的聊天窗口**各登一个账号，
+一边发一边等另一边真的收到（含气泡、未读、已读回执、附件下载）；③登录窗口注册 →
+写本地缓存 → 下次启动**自动登录**（登录界面不再出现）→ 退出登录清缓存。
+假 HTTP 层测不出协议字段写错这类问题，所以这里一律用真服务端。
 
 pytest 已作为 dev 依赖装在项目 venv 里（`pyproject.toml` 的 `[dependency-groups] dev`）。
 两个界面套件是脚本式的（`main()` 返回失败项数），文件末尾各挂了一个 `test_*_suite()`

@@ -1,17 +1,16 @@
 """传输层：把"消息怎么送到对方"这件事抽象成接口。
 
-现在的实现是 :class:`LocalTransport` —— 单机演示：发的消息由脚本里的台词
-自动回复，不联网。将来接真网络时，只需要再写一个实现同一组方法的
-``SocketTransport``（内部用 socket/协议编解码），界面层一行都不用改：
+界面只依赖三个动作：``start()`` / ``send()`` / ``poll()``，所以换实现界面一行都不用改：
 
-    transport = LocalTransport(...)        # 现在
-    transport = SocketTransport("host", 9000)   # 以后
+    transport = NetworkTransport(api)      # 真联网（mchat/core/net_transport.py）
+    transport = LocalTransport(scripts)    # 本机演示/测试（脚本自动回复）
 
-界面只依赖三个动作：``start()`` / ``send()`` / ``poll()``。
+``NetworkTransport`` 是真实使用的那一个：``send()`` 把消息丢进发件箱由后台线程发出，
+``poll()`` 把后台长轮询收到的事件倒给界面 —— 形状和本文件里这个假实现完全一样。
 
 附件（图片/文件）跟着消息一起走：:class:`Outgoing` 与 :class:`TransportEvent` 各带一个
-``attachment``。单机演示里它是"本地路径 + 名字 + 大小"；接真网络时换成"先上传到
-服务端拿到 id，再把 id 放进消息"，这一层的形状不用变。
+``attachment``。联网时由传输层负责"先上传拿到远端 id → 再发消息"，对界面而言
+附件始终是"一个路径 + 名字 + 大小"，这一层的形状没有变。
 """
 from __future__ import annotations
 
@@ -21,39 +20,59 @@ import itertools
 import time
 from dataclasses import dataclass, field
 
-from .models import Attachment
+from .models import Attachment, Conversation, Message, ReplyRef
 
 __all__ = ["Outgoing", "TransportEvent", "ChatTransport", "ReplyScript",
-           "LocalTransport", "EVENT_MESSAGE", "EVENT_TYPING", "EVENT_READ"]
+           "LocalTransport", "NullTransport",
+           "EVENT_MESSAGE", "EVENT_TYPING", "EVENT_READ", "EVENT_CONVERSATION",
+           "EVENT_RESYNC"]
 
 EVENT_MESSAGE = "message"
 EVENT_TYPING = "typing"
 EVENT_READ = "read"
+EVENT_CONVERSATION = "conversation"     # 有人拉我进了新会话（联网时服务端推的）
+EVENT_RESYNC = "resync"                 # 事件流水断了：界面重新拉一次会话列表
 
 
 @dataclass(frozen=True)
 class Outgoing:
-    """一条要发出去的消息（``attachment`` 为 None 就是纯文字）。"""
+    """一条要发出去的消息（``attachment`` 为 None 就是纯文字）。
+
+    ``message_id`` 就是本地那条消息的 id：联网时它会被当成服务端的消息 id
+    （协议里的 ``client_id``），所以**重发同一条不会变成两条**（幂等）。
+    引用 / 转发 / 合并转发这三个"附加信息"也要一起送出去，否则对面收到的
+    就只剩一句光秃秃的话。
+    """
 
     conversation_id: str
     sender_id: str
     text: str
     message_id: str = ""
     attachment: Attachment | None = None
+    reply_to: ReplyRef | None = None
+    forwarded_from: str = ""
+    merged_items: tuple = ()
 
 
 @dataclass(frozen=True)
 class TransportEvent:
-    """从传输层收到的异步事件。"""
+    """从传输层收到的异步事件。
+
+    ``message`` / ``conversation`` 是**联网时才会带上**的完整对象：服务端已经给全了
+    （id、时间戳、引用、转发…），界面直接用，不必自己再拼一个。本机演示那条路
+    仍然只给 ``text`` 这种"散装"字段，界面两种都认。
+    """
 
     kind: str
-    conversation_id: str
+    conversation_id: str = ""      # 有默认值：像 resync 这种"全局"事件不需要会话 id
     sender_id: str = ""
     text: str = ""
     ts: float = 0.0
     typing: bool = False
     message_id: str = ""
     attachment: Attachment | None = None
+    message: Message | None = None
+    conversation: Conversation | None = None
 
 
 @dataclass
@@ -167,3 +186,19 @@ class LocalTransport(ChatTransport):
 
     def _push(self, when: float, event: TransportEvent) -> None:
         heapq.heappush(self._queue, (when, next(self._counter), event))
+
+
+class NullTransport(ChatTransport):
+    """什么都不做的传输层：没登录/没服务器时占位用，界面照常能打开（历史还在本地）。
+
+    "离线"是明确的状态（``online = False``），而不是把界面搞崩。
+    """
+
+    name = "未连接"
+    online = False
+
+    def send(self, message: Outgoing) -> None:
+        return None
+
+    def poll(self, now: float | None = None) -> list[TransportEvent]:
+        return []

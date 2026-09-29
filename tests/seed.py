@@ -1,12 +1,19 @@
-"""单机演示数据：示例会话、消息，以及"对方"的自动回复台词。
+"""**测试专用**的示例数据：示例会话、消息，以及"对方"的自动回复台词。
 
-界面启动时若没有真实传输层（还没有联网版），就用这里的例子把界面填满，
-保证打开就能看到一个像模像样的聊天窗口。所有时间戳都相对"现在"生成，
-所以日期分隔条永远显示"今天 / 昨天"，不会随日期跑偏。
+它以前住在 ``mchat/core/seed.py``，程序启动时用它把界面填满 —— 那时候 MChat 还是
+个单机演示。现在 MChat 是真联网的聊天软件（会话由服务端给、账号要登录），
+**程序里再也不生成任何示例会话**，这个模块搬到 ``tests/`` 下只服务于回归测试：
 
+* 界面测试要有一批现成的会话/消息才能验列表、气泡、未读、回复、转发这些行为；
+* 传输层测试要一个"对方会按台词自动回复"的假对端（:class:`~mchat.core.transport.LocalTransport`），
+  这才不必在跑单测时真起一个服务器。
+
+所以：**它不会出现在用户的程序里**，只有 ``tests/test_*.py`` 会 import 它。
+（导入方式是各测试文件把 ``tests/`` 放进 ``sys.path`` 再 ``import seed``。）
+
+所有时间戳都相对"现在"生成，所以日期分隔条永远显示"今天 / 昨天"，不会随日期跑偏。
 演示数据里还带两条**附件消息**（一张图片 + 一个 PDF），素材是
-``tools/build_demo_assets.py`` 生成、提交在仓库里的：这样打开程序就能看到
-"图片消息 / 文件消息"长什么样，也能看到"对方发来的图片"（LIN 的自动回复带一张图）。
+``tools/build_demo_assets.py`` 生成、提交在仓库里的。
 """
 from __future__ import annotations
 
@@ -14,10 +21,10 @@ import itertools
 import time
 from dataclasses import dataclass
 
-from . import assets as demo_assets
-from .models import Attachment, ChatKind, Conversation, ME_ID, Message, User
-from .store import ChatStore
-from .transport import ReplyScript
+from mchat.core import assets as demo_assets
+from mchat.core.models import Attachment, ChatKind, Conversation, ME_ID, Message, User
+from mchat.core.store import ChatStore
+from mchat.core.transport import ReplyScript
 
 __all__ = ["Demo", "build_demo", "ME", "CHAT_LIN", "CHAT_GROUP", "CHAT_DESIGN",
            "CHAT_CHEN", "CHAT_BOT"]

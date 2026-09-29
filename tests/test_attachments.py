@@ -20,7 +20,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mchat.core import assets as demo_assets                       # noqa: E402
-from mchat.core import seed                                        # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import seed                                                        # noqa: E402
 from mchat.core.models import (Attachment, Conversation, Message,  # noqa: E402
                                human_size)
 from mchat.core.store import ChatStore                             # noqa: E402

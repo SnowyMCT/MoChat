@@ -17,7 +17,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mchat.core import seed, transport                                    # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))         # tests/ 下有 seed.py
+import seed                                                            # noqa: E402
+from mchat.core import transport                                       # noqa: E402
 from mchat.core.crashlog import (CRASH_LOG_NAME,                          # noqa: E402
                                  default_crash_log_path, install_crash_log)                                    # noqa: E402
 from mchat.core.models import (ChatKind, Conversation, Message, PinRef,   # noqa: E402

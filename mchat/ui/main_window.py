@@ -3,39 +3,45 @@
 职责边界
 --------
 * :class:`~mchat.core.store.ChatStore`   —— 数据与未读规则（不依赖 Qt）
-* :class:`~mchat.core.transport.LocalTransport` —— 消息怎么送达（不依赖 Qt）
+* :class:`~mchat.core.net_transport.NetworkTransport` —— 消息怎么送达（不依赖 Qt）
 * :class:`~mchat.ui.sidebar.Sidebar` / :class:`~mchat.ui.chat_view.ChatView`
   —— 只负责显示与交互，通过信号把动作抛给本窗口
-* 本文件 —— 唯一"知道全部"的地方：接线、主题、事件轮询、打开工具箱
+* 本文件 —— 唯一"知道全部"的地方：接线、主题、事件轮询、跟服务端对账
 
-所以想换成真联网时，只需要在 ``__init__`` 里把 ``LocalTransport`` 换成
-socket 版实现，其余代码不用改。
+联网版和本机演示版的差别**只在这里**：登录之后会话列表和聊天记录都从服务端来
+（``load_conversations`` / ``_ensure_history``），发出去的消息走
+``NetworkTransport``（后台线程 + 掉线重发），未读与已读回执跟服务端对账。
+测试仍然可以注入 ``demo=`` + ``LocalTransport`` 把这一层换成"脚本自动回复"，
+下面的逻辑对两者是同一套代码。
 """
 from __future__ import annotations
 
-import sys
+import os
 import tempfile
 import time
 import uuid
-import os
 
-from PyQt6.QtCore import QSettings, QSize, Qt, QTimer, QUrl
+from PyQt6.QtCore import QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (QColor, QDesktopServices, QGuiApplication, QKeySequence,
                          QPalette, QShortcut)
-from PyQt6.QtWidgets import QApplication, QHBoxLayout, QMenu, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QMenu, QWidget
 
-from ..core import seed
-from ..core.crashlog import default_crash_log_path, install_crash_log
+from ..core.api import ApiError, NetworkError
 from ..core.db import DEFAULT_LIMIT, ChatLog
-from ..core.models import ME_ID, Attachment, ChatKind, Message
+from ..core.models import ME_ID, Attachment, ChatKind, Conversation, Message, User
 from ..core.store import MESSAGE, PIN, RESET, ChatStore, StoreEvent
-from ..core.transport import (EVENT_MESSAGE, EVENT_READ, EVENT_TYPING,
-                              LocalTransport, Outgoing)
+from ..core.transport import (EVENT_CONVERSATION, EVENT_MESSAGE, EVENT_READ,
+                              EVENT_RESYNC, EVENT_TYPING, LocalTransport,
+                              NullTransport, Outgoing)
+from ..core.net_transport import NetworkTransport
+from ..core.session import Session
 from .attach import pick_file
 from .chat_view import ATTACH_FILE, ChatView
 from . import anim
+from .async_call import AsyncCall
 from .forward_dialog import ForwardDialog
 from .forward_view import MergedViewerDialog
+from .new_chat_dialog import NewChatDialog
 from .pin_dialog import ask_pin as ask_pin_dialog
 from .search_dialog import SearchDialog
 from .security_tool import SecurityToolDialog
@@ -55,6 +61,9 @@ SETTINGS_APP = "MChat"
 POLL_INTERVAL_MS = 400                      # 事件轮询间隔（真联网时同理）
 CHAT_MIN_WIDTH = 420                        # 无论怎么拖，聊天区至少留这么宽
 CLIPBOARD_DIRNAME = "clipboard"              # 粘进来的图片落在这个子目录里
+ATTACHMENT_DIRNAME = "attachments"           # 别人发来的附件下到这里
+HISTORY_LIMIT = 50                           # 打开一个会话先拉多少条历史
+TYPING_TTL = 6.0                             # "正在输入…"最多显示几秒（对面可能就没下文了）
 
 
 def default_log_path() -> str:
@@ -69,14 +78,23 @@ def default_log_path() -> str:
 
 
 class MainWindow(QWidget):
-    """MChat 聊天窗口。"""
+    """MChat 聊天窗口。
+
+    构造参数里 ``demo`` 和 ``transport`` 是**测试用的注入口**：给一个
+    :class:`~mchat.core.seed.Demo` 就回到"本机演示"那条路（会话与自动回复都现成），
+    真机上走的是 ``session`` + ``api``（联网）。两条路共用下面所有逻辑。
+    """
+
+    logoutRequested = pyqtSignal()          # 侧栏底部「退出登录」→ 启动器负责换窗口
 
     def __init__(self, parent: QWidget | None = None, *, demo=None,
                  transport=None, settings=None, log=None, confirm=None,
-                 filedialog=None, ask_pin=None, clipboard=None):
+                 filedialog=None, ask_pin=None, clipboard=None,
+                 session: Session | None = None, api=None):
         super().__init__(parent)
         self.setObjectName("root")
-        self.setWindowTitle("MChat")
+        name = session.name if session is not None else ""
+        self.setWindowTitle(f"MChat — {name}" if name else "MChat")
         self.setMinimumSize(960, 600)
         self.resize(self._preferred_size())
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
@@ -84,12 +102,32 @@ class MainWindow(QWidget):
         # 设置可以注入（测试用独立命名空间，避免读到用户手动拖出来的宽度）
         self._settings = (settings if settings is not None
                           else QSettings(SETTINGS_ORG, SETTINGS_APP))
-        demo = demo if demo is not None else seed.build_demo()
-        self._store: ChatStore = demo.store
-        self._me = demo.me
-        # 传输层可以注入（测试用假时钟，将来换 socket 实现也走这里）
-        self._transport = transport if transport is not None else LocalTransport(
-            demo.scripts)
+        self._session = session
+        self._api = api
+        self._user_id = str(getattr(session, "user_id", "") or "")
+        # 没有 demo 注入就是**空仓库**：真实使用时会话列表由服务端给（load_conversations）
+        if demo is not None:
+            self._store: ChatStore = demo.store
+            self._me = demo.me
+            self._default_chat_id = demo.default_chat_id
+        else:
+            self._store = ChatStore()
+            self._me = User(ME_ID, session.name if session is not None else "我",
+                            online=True)
+            self._default_chat_id = ""
+        # 本地历史库可以注入（测试用临时文件/内存库，绝不碰用户的真实数据）
+        self._log = log if log is not None else ChatLog(default_log_path())
+        self._log.compact()                       # 启动整理一次：WAL 收回主库，文件更小
+        # 传输层：注入 > 演示脚本 > 真联网 > 空实现（没登录也不会崩）
+        if transport is not None:
+            self._transport = transport
+        elif demo is not None:
+            self._transport = LocalTransport(demo.scripts)
+        elif api is not None:
+            self._transport = NetworkTransport(api, me_id=self._user_id,
+                                               download_dir=self.attachment_dir())
+        else:
+            self._transport = NullTransport()
         self._transport.start()
         self._current_id = ""
         self._sidebar_width = SIDEBAR_WIDTH
@@ -98,13 +136,26 @@ class MainWindow(QWidget):
         self._settings_dialog: SettingsDialog | None = None
         self._forward_dialog: ForwardDialog | None = None
         self._merged_viewer: MergedViewerDialog | None = None
+        self._new_chat_dialog: NewChatDialog | None = None
         # 各会话"还没发出去的附件/待回复的那条"（和草稿一样按会话存，切换会话不会串台）
         self._pending_attachments: dict[str, Attachment] = {}
         self._pending_replies: dict[str, object] = {}
         self._forward_ids: list[str] = []          # 转发窗口里"这次要转发哪几条"
-        # 本地历史库可以注入（测试用临时文件/内存库，绝不碰用户的真实数据）
-        self._log = log if log is not None else ChatLog(default_log_path())
-        self._log.compact()                       # 启动整理一次：WAL 收回主库，文件更小
+        # 联网用的三条后台调用通道（各自只干一类活，互不阻塞）
+        self._load_call = AsyncCall(self)          # 拉会话列表
+        self._history_call = AsyncCall(self)       # 拉某个会话的历史
+        self._action_call = AsyncCall(self)        # 已读回执 / 正在输入 / 下载附件
+        self._load_call.finished.connect(self._on_conversations_loaded)
+        self._history_call.finished.connect(self._on_history_loaded)
+        self._action_call.finished.connect(self._on_action_done)
+        for call in (self._load_call, self._history_call, self._action_call):
+            call.failed.connect(self._on_net_error)
+        self._history_wanted = ""                  # 正在等历史回来的会话
+        self._typing_sent_at = 0.0                 # "正在输入"的节流时间戳
+        self._server_read_at: dict[str, float] = {}  # 已经告诉过服务端的已读位置
+        self._history_loaded: set[str] = set()      # 已经从服务端拉过历史的会话
+        self._auth_notified = False                 # "登录失效"只提示一次
+        self._typing_until: dict[str, float] = {}    # 对面"正在输入…"的过期时间
         # 危险操作的确认弹窗也可以注入（测试里不弹窗、走固定答案）
         self.ask_pin = ask_pin or ask_pin_dialog
         # 剪贴板也是可注入的：测试里换成假实现，免得跑一次测试就把用户
@@ -130,11 +181,13 @@ class MainWindow(QWidget):
         watch_system_palette(self._on_system_palette_changed)
         self._apply_theme()
 
-        self.select_conversation(demo.default_chat_id)
+        self.select_conversation(self._default_chat_id)
         self._poller = QTimer(self)
         self._poller.setInterval(POLL_INTERVAL_MS)
         self._poller.timeout.connect(self.tick)
         self._poller.start()
+        if self._api is not None:
+            self.load_conversations()               # 联网：开场就去服务端要会话列表
 
     # ======================================================================
     # 搭建
@@ -155,6 +208,10 @@ class MainWindow(QWidget):
             min_width=SIDEBAR_MIN_WIDTH, max_width=SIDEBAR_MAX_WIDTH)
         self.chat_view = ChatView(self._store, self,
                                   emoji_recents=self._saved_emoji_recents())
+        # 一个会话都没有（刚注册的账号就是这样）：右侧先说清楚"去哪开第一个会话"，
+        # 省的看到一个没名字的头像和一个空白面板发懵
+        if not self._store.conversations():
+            self.chat_view.show_empty()
 
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
@@ -173,6 +230,7 @@ class MainWindow(QWidget):
         self.split_handle.resetRequested.connect(self.reset_sidebar_width)
         self.chat_view.messageSubmitted.connect(self.send_message)
         self.chat_view.searchRequested.connect(self.open_search)
+        self.chat_view.composer.edit.textChanged.connect(self.notify_typing)
         self.chat_view.emojiUsed.connect(self._remember_emoji)
         self.chat_view.reactionPicked.connect(self.toggle_reaction)
         self.chat_view.messageDeleted.connect(self.delete_message)
@@ -192,6 +250,8 @@ class MainWindow(QWidget):
         self.chat_view.mergedOpened.connect(self.open_merged_view)
         self.chat_view.replyCleared.connect(self._on_reply_cleared)
         self.sidebar.settingsRequested.connect(self.open_settings)
+        self.sidebar.newChatRequested.connect(self.open_new_chat)
+        self.sidebar.logoutRequested.connect(self.logout)
         self.sidebar.conversationMenuRequested.connect(self._show_conversation_menu)
         self._store.subscribe(self._on_store_event)
         self.sidebar.refresh()
@@ -241,6 +301,273 @@ class MainWindow(QWidget):
     def hydrated_count(self) -> int:
         """这次启动从本地库捞回来多少条消息（自检/测试用）。"""
         return self._hydrated
+
+    # ======================================================================
+    # 联网：跟服务端对账（会话列表 / 历史 / 已读 / 正在输入 / 附件下载）
+    # ======================================================================
+    def account(self) -> Session | None:
+        """当前登录的账号（没登录就是 None）。"""
+        return self._session
+
+    def user_name(self) -> str:
+        return self._me.name
+
+    def my_user_id(self) -> str:
+        """我在服务端的 id（判断"这条消息是不是我发的"用；空串 = 本机演示）。"""
+        return self._user_id
+
+    def attachment_dir(self) -> str:
+        """别人发来的附件在本地落脚的地方（和库文件放一块，删账号就一起删）。"""
+        path = self._log.path
+        folder = (os.path.dirname(os.path.abspath(path))
+                  if path and path != ":memory:" else tempfile.gettempdir())
+        return os.path.join(folder, ATTACHMENT_DIRNAME)
+
+    def load_conversations(self) -> bool:
+        """去服务端要会话列表（开窗口、登录后、以及服务端说"重新同步"时调）。"""
+        if self._api is None:
+            return False
+
+        def work():
+            return {"items": self._api.conversations()}
+
+        if not self._load_call.run(work):
+            return False
+        return True
+
+    def _on_conversations_loaded(self, payload) -> None:
+        self._apply_conversations((payload or {}).get("items") or [])
+
+    def _apply_conversations(self, items) -> int:
+        """把服务端的会话列表并进仓库：新增的建出来，已有的换标题/成员/未读。"""
+        from ..core.api import conversation_from_json
+
+        added = 0
+        cleared = self._log.cleared_map()
+        flags = self._log.flags()
+        pins = self._log.pinned_refs()
+        for raw in items:
+            conversation = conversation_from_json(raw, me_id=self._user_id)
+            if conversation is None:
+                continue
+            conversation_id = conversation.id
+            names = flags.get(conversation_id, set())
+            conversation.pinned = "pinned" in names
+            conversation.muted = "muted" in names
+            unread = int(raw.get("unread") or 0)
+            existing = self._store.get(conversation_id)
+            if existing is None:
+                self._store.add_conversation(conversation, unread=unread)
+                # 上次退出前的历史先在本地捞回来（离线也能看），再由服务端补新的
+                self._store.hydrate(conversation_id,
+                                    self._log.load(conversation_id, limit=DEFAULT_LIMIT))
+                conversation.pins = pins.get(conversation_id, ())
+                added += 1
+            else:
+                existing.title = conversation.title
+                existing.kind = conversation.kind
+                existing.members = conversation.members
+                existing.pinned = conversation.pinned
+                existing.muted = conversation.muted
+                if conversation.messages:
+                    self._store.hydrate(conversation_id, conversation.messages)
+                self._store.set_unread(conversation_id, unread)
+            if cleared.get(conversation_id) and unread:
+                # 本地清空过这个会话，但服务端还记着未读：把旧的未读顺手抹掉
+                self._sync_read_to_server(conversation_id)
+        self.sidebar.refresh()
+        self._sync_connection_hint()
+        if self._current_id == "" and added:
+            self.select_conversation(self._store.conversations()[0].id)
+        return added
+
+    def _ensure_history(self, conversation_id: str) -> bool:
+        """打开会话时补历史：界面里只有最近几十条，更早的要向服务端要。"""
+        if self._api is None or not conversation_id:
+            return False
+        if conversation_id in self._history_loaded or self._history_call.is_running():
+            return False
+
+        def work():
+            data = self._api.messages(conversation_id, limit=HISTORY_LIMIT)
+            return {"cid": conversation_id, "messages": list(data.get("messages") or [])}
+
+        if not self._history_call.run(work):
+            return False
+        self._history_wanted = conversation_id
+        return True
+
+    def _on_history_loaded(self, payload) -> None:
+        from ..core.api import messages_from_json
+
+        payload = dict(payload or {})
+        conversation_id = str(payload.get("cid") or "")
+        messages = messages_from_json(payload.get("messages"), me_id=self._user_id)
+        messages = [message for message in messages
+                    if message.ts > self._log.cleared_at(conversation_id)]
+        if messages:
+            for message in messages:
+                self._log.save_message(message)     # 服务端历史也落本地：离线能翻
+            self._store.hydrate(conversation_id, messages)
+        self._history_loaded.add(conversation_id)
+        if conversation_id == self._current_id:
+            conversation = self._store.get(conversation_id)
+            if conversation is not None:
+                self.chat_view.show_conversation(conversation)
+                self._sync_reactions(conversation_id)
+                self._sync_pin_banner()
+        self.sidebar.refresh_item(conversation_id)
+        # 拉的过程中用户又切了会话：把新的那个补上
+        if self._history_wanted != conversation_id:
+            self._ensure_history(self._history_wanted)
+
+    def _sync_read_to_server(self, conversation_id: str, up_to: float | None = None) -> None:
+        """告诉服务端"这个会话我看到哪了"（对方那边的单勾才会变双勾）。"""
+        if self._api is None or not conversation_id:
+            return
+        stamp = time.time() if up_to is None else float(up_to)
+        if self._server_read_at.get(conversation_id, 0.0) >= stamp:
+            return
+        self._server_read_at[conversation_id] = stamp
+
+        def work():
+            self._api.mark_read(conversation_id, stamp)
+            return {"kind": "read", "cid": conversation_id}
+
+        self._action_call.run(work)
+
+    def notify_typing(self) -> None:
+        """"我正在输入" —— 3 秒一次就够（每敲一个字都发会把服务器淹掉）。
+
+        输入框清空（或者消息刚发出去）时发一条 `typing=false`，让对方那边立刻停掉
+        "正在输入…" —— 否则对面会一直看着那三个字，直到下一条消息到达才消失。
+        """
+        conversation_id = self._current_id
+        if self._api is None or not conversation_id:
+            return
+        send = getattr(self._transport, "send_typing", None)
+        if send is None:
+            return
+        has_content = bool(self.chat_view.input_text().strip()) or \
+            bool(self.chat_view.has_pending_attachment())
+        now = time.time()
+        if not has_content:
+            if self._typing_sent_at:
+                self._typing_sent_at = 0.0
+                send(conversation_id, False)
+            return
+        if now - self._typing_sent_at < 3.0:
+            return
+        self._typing_sent_at = now
+        send(conversation_id, True)
+
+    def _on_action_done(self, payload) -> None:
+        payload = dict(payload or {})
+        if payload.get("kind") != "download":
+            return
+        message_id = str(payload.get("message_id") or "")
+        path = str(payload.get("path") or "")
+        message = self._store.message(message_id)
+        if message is None or not path or not os.path.isfile(path):
+            self.toast.show_message("附件下载失败", "warning", 2200)
+            return
+        message.attachment = Attachment.from_path(path)
+        self._log.save_message(message)             # 记下来：下次不用再下
+        conversation = self._store.get(message.conversation_id)
+        if conversation is not None and message.conversation_id == self._current_id:
+            # 附件那一块要从"还没下"变成真图片/文件卡片：整条会话重画一次最省事
+            # （只有下载这类罕见路径会走到，不必为它给气泡加一套增量更新）
+            self.chat_view.show_conversation(conversation)
+            self._sync_reactions(message.conversation_id)
+        self._sync_connection_hint()
+        if payload.get("open"):
+            self.attachment_action(message_id, "open")
+        else:
+            self.toast.show_message("附件已下载", "success", 1600)
+
+    def download_attachment(self, message_id: str, *, open_after: bool = False) -> bool:
+        """把还在服务器上的附件下到本地（点开它时走这条路）。"""
+        message = self._store.message(message_id)
+        attachment = message.attachment if message is not None else None
+        if message is None or attachment is None or not attachment.is_remote:
+            return False
+        api, transport = self._api, self._transport
+        if api is None:
+            return False
+        dest = (transport.cache_path(attachment)
+                if hasattr(transport, "cache_path")
+                else os.path.join(self.attachment_dir(),
+                                  f"{attachment.remote_id}-{attachment.name}"))
+
+        def work():
+            api.download(attachment.remote_id, dest)
+            return {"kind": "download", "message_id": message_id, "path": dest,
+                    "open": open_after}
+
+        if not self._action_call.run(work):
+            return False
+        self.toast.show_message(f"正在下载 {attachment.name} …", "info", 1600)
+        return True
+
+    def _on_net_error(self, error) -> None:
+        """后台调用失败：不弹窗、不打断，用提示条说清楚；登录失效就退回登录界面。"""
+        if isinstance(error, ApiError):
+            if error.is_auth and not self._auth_notified:
+                self._auth_notified = True
+                self.toast.show_message("登录已失效，请重新登录", "warning", 2600)
+                self.logoutRequested.emit()
+            return
+        if isinstance(error, NetworkError):
+            self._sync_connection_hint()
+            return
+
+    def _sync_connection_hint(self) -> None:
+        """侧栏底部那行小字：连着/离线/待发几条 + 当前账号。"""
+        describe = getattr(self._transport, "describe", None)
+        if describe is None:
+            self.sidebar.set_mode_hint(self._transport.name)
+            return
+        name = self._session.name if self._session is not None else ""
+        self.sidebar.set_mode_hint(f"{name} · {describe()}" if name else describe())
+
+    # ======================================================================
+    # 新建会话：找人开聊 / 拉群
+    # ======================================================================
+    def open_new_chat(self) -> NewChatDialog:
+        """左栏那个「＋」：打开新建会话窗口（没有服务器时明确说一句，别装作能建）。"""
+        if self._api is None:
+            self.toast.show_message("没连上服务器，建不了新会话", "warning", 2200)
+            raise RuntimeError("没有服务器连接：请先登录")
+        if self._new_chat_dialog is None:
+            dialog = NewChatDialog(self, api=self._api, theme_name=self.theme_name())
+            dialog.conversationCreated.connect(self.on_conversation_created)
+            self._new_chat_dialog = dialog
+        dialog = self._new_chat_dialog
+        dialog.apply_palette(self.current_palette())
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        return dialog
+
+    def new_chat_dialog(self) -> NewChatDialog | None:
+        return self._new_chat_dialog
+
+    def on_conversation_created(self, data) -> Conversation | None:
+        """服务端建好了会话（单聊或群聊）：加进列表、直接打开。"""
+        from ..core.api import conversation_from_json
+
+        conversation = conversation_from_json(data, me_id=self._user_id)
+        if conversation is None:
+            self.toast.show_message("服务端没返回会话信息", "warning", 2200)
+            return None
+        if self._store.get(conversation.id) is None:
+            self._store.add_conversation(conversation)
+            self._store.hydrate(conversation.id,
+                                self._log.load(conversation.id, limit=DEFAULT_LIMIT))
+        self._history_loaded.add(conversation.id)        # 刚建的空会话，不用再拉历史
+        self.select_conversation(conversation.id)
+        self.toast.show_message(f"已打开「{conversation.title}」", "success", 1800)
+        return conversation
 
     # ======================================================================
     # 左右分界（会话列表宽度）
@@ -541,7 +868,9 @@ class MainWindow(QWidget):
             return []
         for message in created:
             self._transport.send(Outgoing(target_id, ME_ID, message.send_text,
-                                          message.id, attachment=message.attachment))
+                                          message.id, attachment=message.attachment,
+                                          forwarded_from=message.forwarded_from,
+                                          merged_items=message.merged_items))
         self._forward_ids = []
         target = self._store.get(target_id)
         title = target.title if target is not None else "会话"
@@ -653,14 +982,19 @@ class MainWindow(QWidget):
         if not self._confirm(
                 title="清空这个会话的历史", ok_text="清空",
                 text=(f"会删掉「{conversation.title}」的 {count} 条本地消息、相关的表情回应"
-                      "和草稿，**其它会话不受影响**，而且无法撤销。")):
+                      "和草稿，**其它会话不受影响**，而且无法撤销。"
+                      "（这是清空**你这边**的记录，对方的记录还在。）")):
             return False
+        stamp = time.time()
         removed = self._log.clear_conversation(conversation_id)      # 库（并打 cleared 旗标）
         self._store.clear_messages(conversation_id)                 # 内存
         self._pending_attachments.pop(conversation_id, None)        # 待发送的附件也一并清掉
         self._pending_replies.pop(conversation_id, None)            # 待回复的那条同理
         self._store.get(conversation_id).pins = ()                  # 库里已被 clear_conversation 清掉
         self._log.set_flag(conversation_id, "cleared", True)
+        # 记住"清到哪一刻"：往后打开这个会话时，服务端再把这些旧消息发回来也不会冒出来
+        self._log.set_cleared_at(conversation_id, stamp)
+        self._sync_read_to_server(conversation_id, stamp)           # 旧消息也不该再算未读
         if conversation_id == self._current_id:
             self.chat_view.show_conversation(self._store.get(conversation_id))
             self.chat_view.set_input_text("")                       # 草稿也一起没了
@@ -801,6 +1135,9 @@ class MainWindow(QWidget):
         self._sync_drafts()
         self._sync_reactions(conversation_id)
         self._sync_search_scope(conversation_id)    # 搜索范围跟着"我现在看的会话"走
+        self._ensure_history(conversation_id)       # 联网：向服务端补这个会话的历史
+        self._sync_read_to_server(conversation_id)  # 打开了就算读过（对方看到双勾）
+        self._sync_connection_hint()
         return True
 
     def send_message(self, text: str) -> bool:
@@ -824,7 +1161,9 @@ class MainWindow(QWidget):
             return False
         reply = self.chat_view.reply_target()
         message = Message(
-            id=f"out-{uuid.uuid4().hex[:8]}",
+            # id 用完整 uuid：它同时就是"服务端那条消息的 id"（协议里的 client_id），
+            # 重发/重试靠它去重，所以不能短到有碰撞风险
+            id=uuid.uuid4().hex,
             conversation_id=conversation_id,
             sender_id=ME_ID,
             text=text,
@@ -839,9 +1178,10 @@ class MainWindow(QWidget):
         self.chat_view.clear_reply()                    # 回复条一起收掉（引用已经进消息了）
         self._store.append(message)
         self._transport.send(Outgoing(conversation_id, ME_ID, text, message.id,
-                                      attachment=attachment))
+                                      attachment=attachment, reply_to=reply))
         self._log.set_draft(conversation_id, "")        # 发出去了，草稿作废
         self._sync_drafts()
+        self._typing_sent_at = 0.0                      # 下一句话重新计"正在输入"
         return True
 
     # ======================================================================
@@ -900,6 +1240,13 @@ class MainWindow(QWidget):
         attachment = message.attachment if message is not None else None
         if attachment is None:
             return False
+        if attachment.is_remote:
+            # 还在服务器上：先下下来（下完自动打开），别让用户看着"打不开"发愣
+            if action == "folder":
+                self.toast.show_message("文件还没下载，先打开一次再找它所在的文件夹",
+                                        "info", 2200)
+                return False
+            return self.download_attachment(message_id, open_after=True)
         if action == "folder":
             folder = os.path.dirname(os.path.abspath(attachment.path))
             if not os.path.isdir(folder):
@@ -928,26 +1275,95 @@ class MainWindow(QWidget):
         events = self._transport.poll(now)
         for event in events:
             if event.kind == EVENT_MESSAGE:
-                # 回复到达即结束"正在输入…"
-                self.sidebar.set_typing(event.conversation_id, False)
-                if event.conversation_id == self._current_id:
-                    self.chat_view.set_typing(False)
-                self._store.receive(Message(
-                    id=f"in-{uuid.uuid4().hex[:8]}",
-                    conversation_id=event.conversation_id,
-                    sender_id=event.sender_id,
-                    text=event.text,
-                    ts=event.ts or time.time(),
-                    outgoing=False,
-                    attachment=event.attachment,          # 对方发来的图片/文件
-                ))
+                self._apply_incoming(event)
             elif event.kind == EVENT_TYPING:
                 self.sidebar.set_typing(event.conversation_id, event.typing)
                 if event.conversation_id == self._current_id:
                     self.chat_view.set_typing(event.typing)
+                # 对面可能敲一半就走了、"不打字了"那条事件永远收不到：给个过期时间，
+                # 免得"正在输入…"在侧栏挂到天荒地老（Telegram 也是几秒后自己消失）
+                self._typing_until[event.conversation_id] = (
+                    time.time() + TYPING_TTL if event.typing else 0.0)
             elif event.kind == EVENT_READ:
                 self._store.set_read(event.conversation_id, event.message_id)
+            elif event.kind == EVENT_CONVERSATION:
+                self._apply_new_conversation(event)
+            elif event.kind == EVENT_RESYNC:
+                self.resync()
+        # 服务端不认这个令牌了：退回登录界面（启动器负责换窗口）
+        auth_error = str(getattr(self._transport, "auth_error", "") or "")
+        if auth_error and not self._auth_notified:
+            self._auth_notified = True
+            self.toast.show_message(f"{auth_error}，请重新登录", "warning", 3200)
+            self.logoutRequested.emit()
+        self._expire_typing()
+        self._sync_connection_hint()
         return len(events)
+
+    def _expire_typing(self) -> None:
+        """过期的"正在输入…"清掉（见 tick 里那段注释）。"""
+        now = time.time()
+        for conversation_id, until in list(self._typing_until.items()):
+            if until and until > now:
+                continue
+            self._typing_until.pop(conversation_id, None)
+            self.sidebar.set_typing(conversation_id, False)
+            if conversation_id == self._current_id:
+                self.chat_view.set_typing(False)
+
+    def _apply_incoming(self, event) -> None:
+        """收到一条消息：去重 → 清理整成"我这边的样子" → 入库 + 未读。"""
+        message = event.message
+        if message is None:
+            # 本机演示那条路（LocalTransport）只给"散装"字段，这里照旧拼一条
+            message = Message(
+                id=f"in-{uuid.uuid4().hex[:8]}",
+                conversation_id=event.conversation_id,
+                sender_id=event.sender_id,
+                text=event.text,
+                ts=event.ts or time.time(),
+                outgoing=False,
+                attachment=event.attachment,
+            )
+        elif self._store.message(message.id) is not None:
+            return                       # 自己的回显 / 重复事件：已经有了就不再来一条
+        elif self._log.cleared_at(message.conversation_id) >= message.ts:
+            return                       # 这个会话本地清空过，比清空点还早的先不显示
+        if message.sender_id == self._user_id and self._user_id:
+            message.outgoing = True       # 同一个账号在别的设备上发的
+            message.sender_id = ME_ID
+        if self._store.get(message.conversation_id) is None:
+            return                        # 会话还没同步下来（等 conversation 事件/下次拉取）
+        # 消息到达即结束"正在输入…"
+        self.sidebar.set_typing(message.conversation_id, False)
+        if message.conversation_id == self._current_id:
+            self.chat_view.set_typing(False)
+        self._store.receive(message)
+
+    def _apply_new_conversation(self, event) -> None:
+        """服务端推来一个新会话（别人拉我开了单聊/进了群）：加进列表并说一声。"""
+        conversation = event.conversation
+        if conversation is None or self._store.get(conversation.id) is not None:
+            return
+        flags = self._log.flags().get(conversation.id, set())
+        conversation.pinned = "pinned" in flags
+        conversation.muted = "muted" in flags
+        self._store.add_conversation(conversation)
+        self._store.hydrate(conversation.id,
+                            self._log.load(conversation.id, limit=DEFAULT_LIMIT))
+        self.toast.show_message(f"新会话：{conversation.title}", "info", 2600)
+
+    def resync(self) -> bool:
+        """重新对一次账：会话列表 + 当前会话的历史。
+
+        什么时候用：刚连上（游标是从"现在"起的，中间那段的消息服务端不会重放）、
+        或者离线太久、服务端说事件流水已经断了。对一次账就补回来了。
+        """
+        started = self.load_conversations()
+        if self._current_id:
+            self._history_loaded.discard(self._current_id)
+            started = self._ensure_history(self._current_id) or started
+        return started
 
     def _on_store_event(self, event: StoreEvent) -> None:
         if event.kind == RESET:
@@ -1071,6 +1487,8 @@ class MainWindow(QWidget):
             self._forward_dialog.apply_palette(p)
         if self._merged_viewer is not None:
             self._merged_viewer.apply_palette(p)
+        if self._new_chat_dialog is not None:
+            self._new_chat_dialog.apply_palette(p)
         if overlay is not None:
             self.toast.raise_()             # 提示气泡别被快照盖住
 
@@ -1140,37 +1558,59 @@ class MainWindow(QWidget):
     def status_text(self) -> str:
         return self.toast.message()
 
+    def connection_text(self) -> str:
+        """侧栏底部那行小字（连着/离线/几条待发 + 账号）。"""
+        return self.sidebar.mode_hint.text()
+
+    def logout(self) -> bool:
+        """侧栏底部「退出登录」：二次确认后交给启动器换回登录窗口。
+
+        清掉的是**这台电脑上的登录信息**（令牌缓存），本地聊天记录留在库里 ——
+        下次登录同一个账号还能接着看，不用重新下载历史。
+        """
+        name = self._session.name if self._session is not None else ""
+        if not self._confirm(
+                title="退出登录", ok_text="退出",
+                text=(f"会清掉这台电脑上 {name} 的登录信息，下次打开要重新登录。"
+                      "本地的聊天记录不会被删。")):
+            return False
+        self.logoutRequested.emit()
+        return True
+
+    def shutdown(self) -> None:
+        """收尾：停轮询、停后台网络、关掉所有子窗口、存草稿、关库。
+
+        退出登录换窗口时**必须**显式调它（``deleteLater`` 之后不一定还会走到
+        ``closeEvent``），否则那条长轮询线程会一直挂着占住服务器连接。
+        """
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        self._poller.stop()
+        self._transport.stop()
+        for dialog in (self._search_dialog, self._settings_dialog, self._forward_dialog,
+                       self._merged_viewer, self._new_chat_dialog):
+            if dialog is not None:
+                dialog.close()
+        self._save_draft(self._current_id)               # 关窗前把草稿存住
+        self._log.close()
+
     def resizeEvent(self, event) -> None:                # noqa: N802
         super().resizeEvent(event)
         self.toast.reposition()
 
     def closeEvent(self, event) -> None:                 # noqa: N802
-        self._poller.stop()
-        self._transport.stop()
-        if self._search_dialog is not None:
-            self._search_dialog.close()
-        if self._settings_dialog is not None:
-            self._settings_dialog.close()
-        if self._forward_dialog is not None:
-            self._forward_dialog.close()
-        if self._merged_viewer is not None:
-            self._merged_viewer.close()
-        self._save_draft(self._current_id)               # 关窗前把草稿存住
-        self._log.close()
+        self.shutdown()
         super().closeEvent(event)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """程序入口：python main.py"""
-    # 高分屏按真实缩放比渲染，避免汉字被截断
-    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
-    app = QApplication(argv if argv is not None else sys.argv)
-    app.setApplicationName(SETTINGS_APP)
-    app.setOrganizationName(SETTINGS_ORG)
-    # 崩溃留痕：偶发的"窗口直接消失"（段错误）下次能留下栈，写进 %APPDATA% 的 crash.log
-    install_crash_log(default_crash_log_path(os.path.dirname(default_log_path())))
-    window = MainWindow()
-    window.show()
-    return app.exec()
+    """程序入口：``python main.py``。
+
+    真正的启动流程（先账号后界面：缓存自动登录 / 登录窗口 / 主窗口）在
+    :mod:`mchat.ui.launcher` 里，这里只是转出去，保证 ``mchat.app.main`` 这类
+    老写法继续有效。
+    """
+    from .launcher import main as launcher_main
+
+    return launcher_main(argv)

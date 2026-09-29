@@ -274,6 +274,8 @@ class Sidebar(QWidget):
     conversationMenuRequested = pyqtSignal(str, object)   # (会话id, 全局坐标)
     toolRequested = pyqtSignal()
     settingsRequested = pyqtSignal()                      # 点齿轮：开设置区域
+    newChatRequested = pyqtSignal()                       # 点「＋」：找人聊天 / 建群
+    logoutRequested = pyqtSignal()                        # 点「退出」：回登录界面
     themeChanged = pyqtSignal(str)
 
     def __init__(self, store: ChatStore, parent=None):
@@ -319,6 +321,10 @@ class Sidebar(QWidget):
         self.tool_btn.setMinimumHeight(30)
         self.tool_btn.clicked.connect(self.toolRequested)
 
+        # 新建会话：联网版最常用的按钮（找人开聊），放在最顺手的位置
+        self.new_chat_btn = IconButton("plus", self, tooltip="新建会话：找人聊天 / 建个群")
+        self.new_chat_btn.clicked.connect(self.newChatRequested)
+
         # 设置入口：主题 / 文字大小 / 动效都收在那一个窗口里（Ctrl+, 同效）
         self.settings_btn = IconButton("gear", self, tooltip="设置：主题 / 文字大小 / 动效（Ctrl+,）")
         self.settings_btn.clicked.connect(self.settingsRequested)
@@ -330,6 +336,7 @@ class Sidebar(QWidget):
         row.addWidget(self.total_badge)
         row.addStretch(1)
         row.addWidget(self.tool_btn)
+        row.addWidget(self.new_chat_btn)
         row.addWidget(self.settings_btn)
         return row
 
@@ -361,14 +368,27 @@ class Sidebar(QWidget):
         self.theme_seg = SegmentedControl(THEME_OPTIONS, height=32)
         self.theme_seg.setToolTip("界面主题")
         self.theme_seg.valueChanged.connect(self.themeChanged)
-        self.mode_hint = QLabel("本机演示 · 未联网", self)
+        self.mode_hint = QLabel("未连接", self)
         self.mode_hint.setObjectName("sideSectionTitle")
-        self.mode_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mode_hint.setAlignment(Qt.AlignmentFlag.AlignLeft
+                                    | Qt.AlignmentFlag.AlignVCenter)
+        self.mode_hint.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                    QSizePolicy.Policy.Preferred)
+        self.mode_hint.setToolTip("当前账号与连接状态")
+        # 退出登录：退出会回到登录界面（本地聊天记录不删），所以配一个明确的图标 + 确认弹窗
+        self.logout_btn = IconButton("exit", self, size=18, box=28,
+                                     tooltip="退出登录（换账号）")
+        self.logout_btn.clicked.connect(self.logoutRequested)
 
+        hint_row = QHBoxLayout()
+        hint_row.setSpacing(6)
+        hint_row.setContentsMargins(4, 0, 0, 0)
+        hint_row.addWidget(self.mode_hint, 1)
+        hint_row.addWidget(self.logout_btn)
         box = QVBoxLayout()
         box.setSpacing(6)
         box.addWidget(self.theme_seg)
-        box.addWidget(self.mode_hint)
+        box.addLayout(hint_row)
         return self._wrap(box)
 
     @staticmethod
@@ -404,8 +424,12 @@ class Sidebar(QWidget):
         self.refresh_total()
         if not conversations:
             if self._empty_hint is None:
-                self._empty_hint = QLabel("没有匹配的会话", self._list_host)
+                self._empty_hint = QLabel(
+                    "没有匹配的会话" if self._keyword else
+                    "还没有会话\n点上面的「＋」找人开聊，或建个群", self._list_host)
                 self._empty_hint.setObjectName("sideSectionTitle")
+                self._empty_hint.setWordWrap(True)
+                self._empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 self._list_layout.insertWidget(0, self._empty_hint)
                 self._empty_hint.show()
         elif self._empty_hint is not None:
@@ -451,6 +475,13 @@ class Sidebar(QWidget):
         for cid, item in self._items.items():
             item.set_selected(cid == conversation_id)
 
+    def set_mode_hint(self, text: str) -> None:
+        """左下角那行小字：当前账号 + 连接状态（离线/待发几条）。变了才写，别空刷。"""
+        text = str(text or "")
+        if text != self.mode_hint.text():
+            self.mode_hint.setText(text)
+            self.mode_hint.setToolTip(text)
+
     def set_typing(self, conversation_id: str, typing: bool) -> None:
         if typing:
             self._typing.add(conversation_id)
@@ -465,6 +496,8 @@ class Sidebar(QWidget):
         self.theme_seg.apply_palette(palette)
         self.tool_btn.setIcon(make_icon("apps", palette.accent, 16))
         self.settings_btn.set_icon_color(palette.muted)
+        self.new_chat_btn.set_icon_color(palette.accent)
+        self.logout_btn.set_icon_color(palette.muted)
         for item in self._items.values():
             item.apply_palette(palette)
 

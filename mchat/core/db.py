@@ -34,7 +34,7 @@ from .models import (Attachment, Message, PinRef, merged_from_json,   # noqa: F4
 
 __all__ = ["ChatLog", "SearchHit", "DEFAULT_LIMIT", "SEARCH_LIMIT", "TRIGRAM_MIN"]
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_LIMIT = 200        # 单个会话一次取多少条（界面只画这么多）
 SEARCH_LIMIT = 60          # 搜索一次最多返回多少条
 TRIGRAM_MIN = 3            # trigram 索引能命中的最短关键词长度
@@ -90,9 +90,15 @@ CREATE TABLE IF NOT EXISTS chats(
     pinned          INTEGER NOT NULL DEFAULT 0,
     muted           INTEGER NOT NULL DEFAULT 0,
     cleared         INTEGER NOT NULL DEFAULT 0,
-    pinned_message_id TEXT NOT NULL DEFAULT ''
+    pinned_message_id TEXT NOT NULL DEFAULT '',
+    cleared_at      REAL NOT NULL DEFAULT 0      -- v4：本地清空到哪一刻（见下）
 );
 """
+
+# v4 的 ``cleared_at`` 解决的是"联网之后清空历史会复活"这个坑：
+# 清空只是删本地库，服务端那边消息还在 —— 下次打开这个会话会把旧消息**再发回来**，
+# 用户会觉得"我删了它又自己长回来了"。记住一个时间戳，凡是 ts 早于它的消息
+# 一律不再显示（历史回填与推送事件两处都按它过滤），清空才真的持久。
 
 # 全文索引 + 触发器。触发器每次都重建（DROP + CREATE）：这样改索引列名/索引内容时，
 # 老库不需要额外判断，重新打开就自动跟上。
@@ -209,6 +215,10 @@ class ChatLog:
         if "pinned_message_id" not in chat_columns:
             self._db.execute("ALTER TABLE chats ADD COLUMN pinned_message_id TEXT "
                              "NOT NULL DEFAULT ''")
+        # ---- v3 -> v4 ----
+        if "cleared_at" not in chat_columns:
+            self._db.execute("ALTER TABLE chats ADD COLUMN cleared_at REAL "
+                             "NOT NULL DEFAULT 0")
         if changed:
             # v1 的 FTS 表索引的是 text 这一列，列名对不上新的触发器，只能整表重建
             self._db.execute("DROP TABLE IF EXISTS messages_fts")
@@ -312,7 +322,9 @@ class ChatLog:
 
         同时打上 ``cleared`` 旗标：演示数据每次启动都会重新生成，没有这个标记的话
         清空过的会话下次启动又会"活过来"。别动 ``chats`` 表里的其它旗标。
+        ``cleared_at`` 记的是"清到哪一刻"，联网时用它挡住服务端回填的旧消息。
         """
+        stamp = time.time()
         with self._db:
             cursor = self._db.execute(
                 "DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
@@ -320,13 +332,34 @@ class ChatLog:
                              "(SELECT id FROM messages)")
             self._db.execute("DELETE FROM drafts WHERE conversation_id = ?", (conversation_id,))
             self._db.execute(
-                "INSERT INTO chats(conversation_id, cleared) VALUES (?, 1) "
-                "ON CONFLICT(conversation_id) DO UPDATE SET cleared = 1", (conversation_id,))
+                "INSERT INTO chats(conversation_id, cleared, cleared_at) VALUES (?, 1, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET cleared = 1,"
+                " cleared_at = excluded.cleared_at", (conversation_id, stamp))
             # 置顶的那条也被删了，顺手把置顶清掉 —— 否则下次进来会指一条不存在的消息
             self._db.execute("UPDATE chats SET pinned_message_id = '' "
                              "WHERE conversation_id = ?", (conversation_id,))
         self.compact()               # 腾出来的页还给系统（几十毫秒），文件真的变小
         return cursor.rowcount
+
+    # ------------------------------------------------------------------ 清空点
+    def set_cleared_at(self, conversation_id: str, stamp: float) -> None:
+        """记下"这个会话被清空到哪一刻"（联网时用它不再显示更早的消息）。"""
+        with self._db:
+            self._db.execute(
+                "INSERT INTO chats(conversation_id, cleared_at) VALUES (?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET cleared_at = excluded.cleared_at",
+                (conversation_id, float(stamp)))
+
+    def cleared_at(self, conversation_id: str) -> float:
+        row = self._db.execute("SELECT cleared_at FROM chats WHERE conversation_id = ?",
+                               (conversation_id,)).fetchone()
+        return float(row["cleared_at"]) if row else 0.0
+
+    def cleared_map(self) -> dict[str, float]:
+        """``{会话id: 清空时间戳}``（一次读回来，别在循环里逐个查库）。"""
+        return {row["conversation_id"]: float(row["cleared_at"]) for row in
+                self._db.execute("SELECT conversation_id, cleared_at FROM chats"
+                                 " WHERE cleared_at > 0").fetchall()}
 
     # ================================================================== 读
     def load(self, conversation_id: str, *, limit: int = DEFAULT_LIMIT) -> list[Message]:

@@ -33,7 +33,8 @@ from PyQt6.QtTest import QTest                                          # noqa: 
 from PyQt6.QtWidgets import QApplication, QDialog, QLabel                           # noqa: E402
 
 from mchat.core import assets as core_assets                            # noqa: E402
-from mchat.core import seed                                             # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import seed                                                             # noqa: E402
 from mchat.core.db import ChatLog                                       # noqa: E402
 from mchat.core.models import Attachment, Message, PinRef               # noqa: E402
 from mchat.core.transport import LocalTransport                         # noqa: E402

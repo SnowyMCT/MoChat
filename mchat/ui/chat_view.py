@@ -1588,10 +1588,10 @@ class ChatView(QWidget):
         icon = QLabel(page)
         icon.setPixmap(make_icon("smile", "#9AA7B4", 64).pixmap(QSize(64, 64)))
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title = QLabel("选一个会话开始聊天", page)
+        title = QLabel("还没有说话的对象", page)
         title.setObjectName("emptyTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint = QLabel("左侧是会话列表；需要 Base64 / AES 工具时点「工具箱」（Ctrl+T）",
+        hint = QLabel("点左栏的「＋」搜人开聊、建个群；对方先给你发消息，会话也会自己出现",
                       page)
         hint.setObjectName("emptyText")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1670,11 +1670,17 @@ class ChatView(QWidget):
         self.typing_dots.stop()
         self.message_list.set_conversation(conversation)
         self.stack.setCurrentIndex(1)
+        self.header_avatar.show()            # 空态时收起来的头像，进来会话要放出来
         self.composer.edit.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def show_empty(self) -> None:
+        """没有任何会话时的样子：收掉头像、把标题换成应用名（别留一个红色的"?"）。"""
         self._conversation = None
         self.stack.setCurrentIndex(0)
+        self.header_avatar.hide()
+        self.name_label.setText("MChat")
+        self.status_label.setText("还没有会话")
+        self.status_label.setProperty("typing", "false")
 
     def append_message(self, message: Message) -> None:
         conversation = self._store.get(message.conversation_id)
