@@ -8,6 +8,10 @@
     transport = SocketTransport("host", 9000)   # 以后
 
 界面只依赖三个动作：``start()`` / ``send()`` / ``poll()``。
+
+附件（图片/文件）跟着消息一起走：:class:`Outgoing` 与 :class:`TransportEvent` 各带一个
+``attachment``。单机演示里它是"本地路径 + 名字 + 大小"；接真网络时换成"先上传到
+服务端拿到 id，再把 id 放进消息"，这一层的形状不用变。
 """
 from __future__ import annotations
 
@@ -16,6 +20,8 @@ import heapq
 import itertools
 import time
 from dataclasses import dataclass, field
+
+from .models import Attachment
 
 __all__ = ["Outgoing", "TransportEvent", "ChatTransport", "ReplyScript",
            "LocalTransport", "EVENT_MESSAGE", "EVENT_TYPING", "EVENT_READ"]
@@ -27,12 +33,13 @@ EVENT_READ = "read"
 
 @dataclass(frozen=True)
 class Outgoing:
-    """一条要发出去的消息。"""
+    """一条要发出去的消息（``attachment`` 为 None 就是纯文字）。"""
 
     conversation_id: str
     sender_id: str
     text: str
     message_id: str = ""
+    attachment: Attachment | None = None
 
 
 @dataclass(frozen=True)
@@ -46,22 +53,33 @@ class TransportEvent:
     ts: float = 0.0
     typing: bool = False
     message_id: str = ""
+    attachment: Attachment | None = None
 
 
 @dataclass
 class ReplyScript:
-    """单机演示用：某个会话由谁、按什么台词、延迟多久回复。"""
+    """单机演示用：某个会话由谁、按什么台词、延迟多久回复。
+
+    ``attachments`` 是"对方会陆续发过来的文件"：第 n 次回复带上第 n 个附件，
+    用完就不再带 —— 这样"收到别人发来的图片/文件"这条路径也能在本机演示里跑通，
+    不用手写假事件。
+    """
 
     sender_id: str
     lines: tuple[str, ...]
     latency: float = 1.2
     typing_lead: float = 0.3
+    attachments: tuple[Attachment, ...] = field(default_factory=tuple)
 
     def line(self, index: int) -> str:
         """按序取台词（循环使用，超出部分回到开头）。"""
         if not self.lines:
             return ""
         return self.lines[index % len(self.lines)]
+
+    def attachment(self, index: int) -> Attachment | None:
+        """第 ``index`` 次回复附带的文件（没有就是 None）。"""
+        return self.attachments[index] if index < len(self.attachments) else None
 
 
 class ChatTransport(abc.ABC):
@@ -109,7 +127,10 @@ class LocalTransport(ChatTransport):
     # ------------------------------------------------------------------ 接口
     def send(self, message: Outgoing) -> None:
         script = self._scripts.get(message.conversation_id)
-        if script is None or not message.text.strip():
+        if script is None:
+            return
+        # 空消息不回：既没文字也没附件的调用不该触发一轮"对方正在输入…"
+        if not message.text.strip() and message.attachment is None:
             return
         now = self._clock()
         index = self._replies_sent.get(message.conversation_id, 0)
@@ -122,6 +143,7 @@ class LocalTransport(ChatTransport):
             kind=EVENT_MESSAGE, conversation_id=message.conversation_id,
             sender_id=script.sender_id, text=script.line(index),
             ts=now + script.latency, typing=False,
+            attachment=script.attachment(index),
         ))
         if message.message_id:
             # 顺手模拟一次"对方已读"，气泡上的单勾会变双勾

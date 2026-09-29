@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import math
+
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import QToolButton
@@ -59,13 +61,6 @@ def _apps(painter: QPainter, color: QColor) -> None:
         painter.drawRoundedRect(QRectF(x, y, 0.32, 0.32), 0.09, 0.09)
 
 
-def _more(painter: QPainter, color: QColor) -> None:
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(color)
-    for y in (0.18, 0.5, 0.82):
-        _dot(painter, 0.5, y, 0.085)
-
-
 def _plus(painter: QPainter, color: QColor) -> None:
     _pen(painter, color, 0.11)
     painter.drawLine(QPointF(0.16, 0.5), QPointF(0.84, 0.5))
@@ -89,6 +84,72 @@ def _check(painter: QPainter, color: QColor) -> None:
     painter.drawLine(QPointF(0.38, 0.76), QPointF(0.84, 0.24))
 
 
+def _clip(painter: QPainter, color: QColor) -> None:
+    """回形针：外圈一条"长 U" + 里侧一条短勾（附件按钮）。"""
+    _pen(painter, color, 0.085)
+    path = QPainterPath()
+    path.moveTo(0.30, 0.72)                    # 左下开口
+    path.lineTo(0.30, 0.32)
+    path.arcTo(QRectF(0.30, 0.12, 0.40, 0.40), 180.0, -180.0)   # 顶端半圆到 (0.70, 0.32)
+    path.lineTo(0.70, 0.74)
+    path.arcTo(QRectF(0.46, 0.56, 0.24, 0.36), 0.0, -180.0)     # 底部小回勾到 (0.46, 0.56)
+    path.lineTo(0.46, 0.30)
+    painter.drawPath(path)
+
+
+def _file(painter: QPainter, color: QColor) -> None:
+    """文档：右上角折角 + 两条正文线（文件卡片上的图标）。"""
+    _pen(painter, color, 0.078)
+    body = QPainterPath()
+    body.moveTo(0.24, 0.12)
+    body.lineTo(0.60, 0.12)
+    body.lineTo(0.78, 0.32)
+    body.lineTo(0.78, 0.88)
+    body.lineTo(0.24, 0.88)
+    body.closeSubpath()
+    painter.drawPath(body)
+    painter.drawLine(QPointF(0.58, 0.12), QPointF(0.58, 0.34))    # 折角
+    painter.drawLine(QPointF(0.58, 0.34), QPointF(0.78, 0.34))
+    _pen(painter, color, 0.062)                                   # 正文线
+    painter.drawLine(QPointF(0.36, 0.52), QPointF(0.66, 0.52))
+    painter.drawLine(QPointF(0.36, 0.68), QPointF(0.58, 0.68))
+
+
+def _image(painter: QPainter, color: QColor) -> None:
+    """相框 + 太阳 + 山（图片消息 / "选图片"那个菜单项）。"""
+    _pen(painter, color, 0.078)
+    painter.drawRoundedRect(QRectF(0.12, 0.18, 0.76, 0.64), 0.10, 0.10)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(color)
+    _dot(painter, 0.34, 0.37, 0.055)
+    hills = QPainterPath()
+    hills.moveTo(0.16, 0.76)
+    hills.lineTo(0.40, 0.48)
+    hills.lineTo(0.58, 0.68)
+    hills.lineTo(0.68, 0.58)
+    hills.lineTo(0.84, 0.76)
+    hills.closeSubpath()
+    painter.drawPath(hills)
+
+
+def _gear(painter: QPainter, color: QColor) -> None:
+    """齿轮：一个圆环 + 八颗朝外的齿（设置入口）。
+
+    比"真齿轮轮廓"省事得多，20px 下反而更清楚：圆环是齿根，短齿只要够粗就不会糊。
+    """
+    _pen(painter, color, 0.085)
+    center = QPointF(0.5, 0.5)
+    ring = 0.27
+    painter.drawEllipse(center, ring, ring)
+    for index in range(8):
+        angle = index * math.pi / 4
+        cos, sin = math.cos(angle), math.sin(angle)
+        painter.drawLine(QPointF(center.x() + (ring - 0.03) * cos,
+                                 center.y() + (ring - 0.03) * sin),
+                         QPointF(center.x() + (ring + 0.13) * cos,
+                                 center.y() + (ring + 0.13) * sin))
+
+
 def _double_check(painter: QPainter, color: QColor) -> None:
     _pen(painter, color, 0.105)
     painter.drawLine(QPointF(0.06, 0.54), QPointF(0.28, 0.76))
@@ -101,11 +162,14 @@ _PAINTERS = {
     "search": _search,
     "send": _send,
     "apps": _apps,
-    "more": _more,
     "plus": _plus,
     "smile": _smile,
     "check": _check,
     "double_check": _double_check,
+    "clip": _clip,
+    "file": _file,
+    "image": _image,
+    "gear": _gear,
 }
 
 

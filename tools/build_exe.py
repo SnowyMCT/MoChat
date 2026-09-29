@@ -1,4 +1,4 @@
-"""一条命令打出"带旗帜素材"的 exe，并当场验证素材真进去了。
+"""一条命令打出"带素材"的 exe，并当场验证素材真进去了。
 
 用法：
     python tools/build_exe.py            # 打包（onefile + 无控制台）+ 自检
@@ -6,9 +6,10 @@
 
 为什么不用 `pyinstaller -F -w main.py`
 -------------------------------------
-那条命令不带任何 data 文件，而旗帜是**图片素材**（mchat/assets/flags.png + 逐张 PNG）：
-冻结后 flags.sprite_exists()/png_exists() 全假，界面整体降级成纯文本，
-Windows 的 Segoe UI Emoji 不画国旗 → 旗帜全部变成 "CN" "JP" 两个字母。
+那条命令不带任何 data 文件，而素材是**图片/文件本体**（mchat/assets/ 下的旗帜精灵图
++ 逐张 PNG，以及演示附件用的图片与 PDF）：冻结后 flags.sprite_exists()/png_exists() 全假，
+界面整体降级成纯文本，Windows 的 Segoe UI Emoji 不画国旗 → 旗帜全部变成 "CN" "JP"
+两个字母；演示数据里的图片消息/文件消息也会因为找不到文件而变成"不在本地"。
 所以素材必须按 datas 打进去（见 main.spec），并且**打包后当场核对**：
 直接读 PyInstaller 自己写的 build/main/PKG-00.toc 清单，确认 mchat/assets 下的文件都在包里。
 
@@ -31,6 +32,7 @@ SPEC = os.path.join(ROOT, "main.spec")
 ASSETS = os.path.join(ROOT, "mchat", "assets")
 SPRITE = os.path.join(ASSETS, "flags.png")
 PNG_DIR = os.path.join(ASSETS, "flags")
+DEMO_DIR = os.path.join(ASSETS, "demo")
 TOC_PATH = os.path.join(ROOT, "build", "main", "PKG-00.toc")
 TOC_PREFIX = "mchat" + os.sep + "assets"          # 清单里的条目名（Windows 上是反斜杠）
 
@@ -44,7 +46,8 @@ def fail(message: str) -> None:
 def check_assets() -> int:
     """打包前先确认素材齐：缺素材打出来的 exe 一定是坏的，现在报比事后翻包快。"""
     sys.path.insert(0, ROOT)
-    from mchat.ui import flags as flag_data               # 零 Qt 依赖，纯查表
+    from mchat.core import assets as demo_assets           # 零 Qt 依赖，纯查路径
+    from mchat.ui import flags as flag_data                # 零 Qt 依赖，纯查表
 
     if not os.path.isfile(SPRITE):
         fail(f"缺精灵图：{SPRITE}（跑 tools/build_flags.py 生成）")
@@ -54,8 +57,15 @@ def check_assets() -> int:
     if len(names) != len(flag_data.FLAGS):
         fail(f"逐张 PNG 数量不对：{len(names)} != {len(flag_data.FLAGS)}"
              f"（跑 tools/build_flags.py 重新生成）")
-    expected = len(names) + 1                             # +1 = 精灵图
-    print(f"  OK  素材就位：flags.png + {len(names)} 张 PNG，共 {expected} 个文件")
+    # 演示附件（图片消息 / 文件消息的素材）也必须有：少了它们，界面上那两条演示消息
+    # 会显示成"文件不在本地"，截图和真机验收立刻就能看出来。
+    for name in (demo_assets.DEMO_PHOTO, demo_assets.DEMO_REPORT):
+        path = demo_assets.demo_path(name)
+        if not os.path.isfile(path):
+            fail(f"缺演示附件素材：{path}（跑 tools/build_demo_assets.py 生成）")
+    expected = len(names) + 1 + 2                         # +1 精灵图，+2 演示附件
+    print(f"  OK  素材就位：flags.png + {len(names)} 张 PNG + 2 个演示附件，"
+          f"共 {expected} 个文件")
     return expected
 
 

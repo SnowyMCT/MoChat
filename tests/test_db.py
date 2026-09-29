@@ -5,6 +5,8 @@
 覆盖：
     落库与读取 —— 幂等 upsert、时间正序、limit 取最近 N 条、按会话隔离
     全文检索   —— 中文子串、英文子串、短词（<3 字符走 LIKE）、片段、上限、无命中
+    附件       —— 附件随消息落库/读回、按附件文件名检索、附件计数
+    库结构升级 —— v1 老库自动迁移到 v2（补列 + 重建索引 + 幂等）
     互动与草稿 —— 表情开关与计数、整会话一次取、草稿增删查
     维护操作   —— 删除消息连互动一起删、清空历史、stats
     效率基准   —— 2 万条批量落库耗时、检索耗时、文件占用（"占用少、效率高"的实测证据）
@@ -12,28 +14,41 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mchat.core.db import (DEFAULT_LIMIT, SEARCH_LIMIT, TRIGRAM_MIN,  # noqa: E402
-                           ChatLog)
-from mchat.core.models import Message                                  # noqa: E402
+from mchat.core.db import (DEFAULT_LIMIT, SCHEMA_VERSION, SEARCH_LIMIT,  # noqa: E402
+                           TRIGRAM_MIN, ChatLog)
+from mchat.core.models import (Attachment, MergedItem, Message,       # noqa: E402
+                               PinRef, ReplyRef, merged_from_json,
+                               reply_from_json)
 
 CHAT = "chat-a"
 OTHER = "chat-b"
 
 
 def _msg(mid: str, text: str, ts: float, *, conv: str = CHAT, outgoing: bool = False,
-         sender: str = "lin") -> Message:
+         sender: str = "lin", attachment: Attachment | None = None,
+         reply_to: ReplyRef | None = None, forwarded_from: str = "",
+         merged_items: tuple[MergedItem, ...] = ()) -> Message:
     return Message(id=mid, conversation_id=conv, sender_id=sender, text=text, ts=ts,
-                   outgoing=outgoing)
+                   outgoing=outgoing, attachment=attachment, reply_to=reply_to,
+                   forwarded_from=forwarded_from, merged_items=merged_items)
 
 
 def _log(**kw) -> ChatLog:
     return ChatLog(kw.pop("path", ":memory:"))
+
+
+def _write(path: str, size: int = 2048) -> str:
+    """造一个真实文件（附件的大小取自磁盘，所以测试里得真写一个）。"""
+    with open(path, "wb") as handle:
+        handle.write(b"m" * size)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +203,322 @@ def test_search_survives_edit_and_delete():
     assert [h.message_id for h in log.search("日本")] == ["m1"]
     assert log.delete_message("m1") is True
     assert log.search("日本") == []
+    log.close()
+
+
+# ---------------------------------------------------------------------------
+# 附件
+# ---------------------------------------------------------------------------
+def test_attachment_round_trip():
+    """附件跟着消息一起落库、一起读回；纯附件消息的正文是空串（预览另算）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf = Attachment.from_path(_write(os.path.join(tmp, "评审材料-v3.pdf"), 2048))
+        png = Attachment.from_path(_write(os.path.join(tmp, "配色预览.png"), 4096))
+        log = _log()
+        log.save_message(_msg("m1", "文件在这，看下。", 100.0, attachment=pdf))
+        log.save_message(_msg("m2", "", 101.0, attachment=png))
+        log.save_message(_msg("m3", "没有附件的普通消息", 102.0))
+
+        loaded = {m.id: m for m in log.load(CHAT)}
+        assert loaded["m1"].attachment == pdf                 # frozen dataclass 直接比
+        assert loaded["m1"].attachment.name == "评审材料-v3.pdf"
+        assert loaded["m1"].attachment.size == 2048
+        assert loaded["m1"].kind == "file" and loaded["m1"].text == "文件在这，看下。"
+        assert loaded["m2"].kind == "image" and loaded["m2"].preview_text == "📷 照片"
+        assert loaded["m3"].attachment is None and loaded["m3"].kind == "text"
+        assert log.stats()["attachments"] == 2
+        log.close()
+
+
+def test_upsert_replaces_attachment_too():
+    """同 id 再写一次：附件也要跟着换（不能只更新正文，留下上一条的附件）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        first = Attachment.from_path(_write(os.path.join(tmp, "a.png"), 100))
+        second = Attachment.from_path(_write(os.path.join(tmp, "b.pdf"), 200))
+        log = _log()
+        log.save_message(_msg("m1", "第一条", 100.0, attachment=first))
+        log.save_message(_msg("m1", "改成第二条", 100.0, attachment=second))
+        loaded = log.load(CHAT)[0]
+        assert loaded.text == "改成第二条"
+        assert loaded.attachment == second and loaded.attachment.name == "b.pdf"
+        log.close()
+
+
+def test_broken_attachment_json_is_ignored():
+    """库里那一列是坏 JSON 时当作"没有附件"，不能让界面读崩。"""
+    log = _log()
+    log.save_message(_msg("m1", "正文", 100.0))
+    with log._db:
+        log._db.execute("UPDATE messages SET attachment = ? WHERE id = 'm1'", ("{坏数据",))
+    assert log.load(CHAT)[0].attachment is None
+    log.close()
+
+
+def test_search_finds_attachment_file_name():
+    """索引的是"正文 + 附件文件名"：只在文件名里出现过的词也要搜得到。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        report = Attachment.from_path(_write(os.path.join(tmp, "季度复盘报告.pdf"), 111))
+        photo = Attachment.from_path(_write(os.path.join(tmp, "秋天在山里拍的.png"), 222))
+        log = _log()
+        log.save_message(_msg("m1", "附件发你，收一下。", 100.0, attachment=report))
+        log.save_message(_msg("m2", "", 101.0, attachment=photo))
+        log.save_message(_msg("m3", "完全不相关的一句话", 102.0))
+
+        assert [h.message_id for h in log.search("复盘报告")] == ["m1"]     # 4 字走 FTS
+        assert [h.message_id for h in log.search("季度复盘")] == ["m1"]
+        assert [h.message_id for h in log.search("复盘")] == ["m1"]         # 2 字走 LIKE
+        assert [h.message_id for h in log.search("在山里")] == ["m2"]       # 纯附件消息
+        assert "复盘报告" in log.search("复盘报告")[0].snippet
+        assert log.search("表里没有这个词") == []
+        # 正文照样能搜（索引串 = 正文 + 文件名，两者都在）
+        assert [h.message_id for h in log.search("附件发你")] == ["m1"]
+        log.close()
+
+
+def test_clear_and_delete_keep_attachment_search_in_sync():
+    """FTS 触发器对附件消息同样有效：改、删之后索引不能残留。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        first = Attachment.from_path(_write(os.path.join(tmp, "旧方案.pdf"), 10))
+        second = Attachment.from_path(_write(os.path.join(tmp, "新方案.pdf"), 20))
+        log = _log()
+        log.save_message(_msg("m1", "第一版", 100.0, attachment=first))
+        log.save_message(_msg("m1", "第二版", 100.0, attachment=second))    # 触发器走 UPDATE
+        assert [h.message_id for h in log.search("旧方案")] == []
+        assert [h.message_id for h in log.search("新方案")] == ["m1"]
+
+        log.delete_message("m1")
+        assert log.search("新方案") == []
+        log.close()
+
+
+# ---------------------------------------------------------------------------
+# 库结构升级（老用户的 v1 库）
+# ---------------------------------------------------------------------------
+LEGACY_SCHEMA = """
+CREATE TABLE messages(
+    id              TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    sender_id       TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    ts              REAL NOT NULL,
+    outgoing        INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'sent'
+);
+CREATE INDEX idx_messages_conv ON messages(conversation_id, ts);
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    text, content='messages', content_rowid='rowid', tokenize='trigram'
+);
+CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, text)
+    VALUES ('delete', old.rowid, old.text);
+END;
+CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, text)
+    VALUES ('delete', old.rowid, old.text);
+    INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+"""
+
+
+def _make_v1_db(path: str) -> None:
+    """照 v1 的样子造一个老库（老用户 %APPDATA% 里那个就是这个结构）。"""
+    raw = sqlite3.connect(path)
+    raw.executescript(LEGACY_SCHEMA)
+    raw.execute("INSERT INTO messages(id, conversation_id, sender_id, text, ts,"
+                " outgoing, status) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                ("m1", CHAT, "lin", "这周要去日本和美国出差", 100.0, 0, "sent"))
+    raw.execute("INSERT INTO messages(id, conversation_id, sender_id, text, ts,"
+                " outgoing, status) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                ("m2", CHAT, "me", "收到", 101.0, 1, "read"))
+    raw.execute("PRAGMA user_version=1")
+    raw.commit()
+    raw.close()
+
+
+def test_migrates_v1_database():
+    """v1 老库打开即升级：老消息一条不丢、检索照旧、新列可用；再开一次仍然幂等。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mchat.db")
+        _make_v1_db(path)
+
+        log = ChatLog(path)
+        assert log._db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        columns = {row["name"] for row in log._db.execute("PRAGMA table_xinfo(messages)")}
+        assert {"attachment", "file_name", "search_text"} <= columns
+        # v3 的三列 + 会话表的置顶列也要补上（v1 直接跳到当前版本）
+        assert {"reply_to", "forwarded_from", "merged"} <= columns
+        chat_columns = {row["name"] for row in log._db.execute("PRAGMA table_xinfo(chats)")}
+        assert "pinned_message_id" in chat_columns
+        loaded = log.load(CHAT)
+        assert [m.id for m in loaded] == ["m1", "m2"]
+        assert loaded[0].text == "这周要去日本和美国出差"
+        assert loaded[0].attachment is None and loaded[0].kind == "text"
+        assert loaded[1].status == "read"
+        # 老数据在重建后的索引里照样搜得到
+        assert [h.message_id for h in log.search("日本")] == ["m1"]
+        assert [h.message_id for h in log.search("收到")] == ["m2"]
+
+        # 升级完就能用新功能：附件落库 + 按文件名检索
+        file_path = _write(os.path.join(tmp, "老库升级后的附件.pdf"), 512)
+        log.save_message(_msg("m3", "", 102.0,
+                              attachment=Attachment.from_path(file_path)))
+        assert [h.message_id for h in log.search("老库升级后")] == ["m3"]
+        assert log.stats()["attachments"] == 1
+        log.close()
+
+        again = ChatLog(path)                       # 第二次打开：什么都不用做
+        assert again.count(CHAT) == 3
+        assert again.load(CHAT)[2].attachment.name == "老库升级后的附件.pdf"
+        assert [h.message_id for h in again.search("日本")] == ["m1"]
+        again.close()
+
+
+def test_migrates_v2_database():
+    """v2 老库升到 v3：补 4 列（回复/转发/合并 + 会话置顶），老数据与检索都不受影响。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mchat.db")
+        # 先按当前版本建库、写入老数据，再把 v3 的列"拆掉"，模拟 v2 的库
+        log = ChatLog(path)
+        log.save_message(_msg("m1", "v2 时代的一条消息", 100.0))
+        log.save_message(_msg("m2", "另外一条", 102.0, outgoing=True))
+        log.close()
+        raw = sqlite3.connect(path)
+        for column in ("reply_to", "forwarded_from", "merged"):
+            raw.execute(f"ALTER TABLE messages DROP COLUMN {column}")
+        raw.execute("ALTER TABLE chats DROP COLUMN pinned_message_id")
+        raw.execute("PRAGMA user_version=2")
+        raw.commit()
+        raw.close()
+
+        upgraded = ChatLog(path)
+        assert upgraded._db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        columns = {row["name"] for row in upgraded._db.execute("PRAGMA table_xinfo(messages)")}
+        assert {"reply_to", "forwarded_from", "merged"} <= columns
+        chat_columns = {row["name"] for row in upgraded._db.execute("PRAGMA table_xinfo(chats)")}
+        assert "pinned_message_id" in chat_columns
+        # 老消息照旧：正文、检索、新列都是"空"的语义
+        loaded = upgraded.load(CHAT)
+        assert [m.id for m in loaded] == ["m1", "m2"]
+        assert loaded[0].text == "v2 时代的一条消息"
+        assert loaded[0].reply_to is None and loaded[0].merged_items == ()
+        assert loaded[0].forwarded_from == ""
+        assert [h.message_id for h in upgraded.search("v2 时代")] == ["m1"]
+        # 升完就能用新能力
+        upgraded.save_message(_msg("m3", "", 103.0, outgoing=True,
+                                   forwarded_from="另一个会话",
+                                   merged_items=(MergedItem("我", "第一条"),)))
+        assert upgraded.load(CHAT)[2].merged_items[0].text == "第一条"
+        upgraded.close()
+
+
+# ---------------------------------------------------------------------------
+# 回复 / 转发 / 合并转发 / 会话内置顶（v3）
+# ---------------------------------------------------------------------------
+def test_reply_round_trip():
+    """回复的引用块跟着消息一起落库、读回来还认得。"""
+    log = ChatLog(":memory:")
+    reply = ReplyRef("m1", "王尼玛", "周五那份材料我先过一遍")
+    log.save_message(_msg("m9", "好，我也看一下", 200.0, outgoing=True, reply_to=reply))
+    loaded = log.load(CHAT)[0]
+    assert loaded.reply_to == reply
+    assert loaded.is_reply and loaded.reply_to.text == "王尼玛：周五那份材料我先过一遍"
+    # 覆盖写入（同 id 再存一次）也要跟着更新，而不是留着旧引用
+    log.save_message(_msg("m9", "改主意了", 201.0, outgoing=True,
+                          reply_to=ReplyRef("m2", "我", "另一条")))
+    again = log.load(CHAT)[0]
+    assert again.reply_to.message_id == "m2" and again.text == "改主意了"
+    log.close()
+
+
+def test_forward_round_trip():
+    """逐条转发与合并转发都要能原样落库读回（含附件名）。"""
+    log = ChatLog(":memory:")
+    single = _msg("f1", "转发过来的原文", 300.0, outgoing=True, forwarded_from="王尼玛")
+    merged = _msg("f2", "", 301.0, outgoing=True, forwarded_from="设计组",
+                  merged_items=(MergedItem("曹尼玛", "配色再淡一点", "配色预览.png", "14:05"),
+                                MergedItem("我", "收到", "", "14:07")))
+    log.save_messages([single, merged])
+    loaded = {m.id: m for m in log.load(CHAT)}
+    assert loaded["f1"].is_forwarded and loaded["f1"].forwarded_from == "王尼玛"
+    assert not loaded["f1"].is_merged
+    assert loaded["f2"].is_merged and loaded["f2"].merged_count == 2
+    assert loaded["f2"].merged_items[0].attachment == "配色预览.png"
+    assert loaded["f2"].merged_items[0].clock == "14:05"        # 每条的时间也要能往返
+    assert loaded["f2"].merged_items[1].clock == "14:07"
+    assert loaded["f2"].merged_line(0) == "曹尼玛：配色再淡一点"
+    # 老数据（没有 clock 字段）读回来是空串，不该炸
+    assert MergedItem.from_json({"author": "我", "text": "老数据"}).clock == ""
+    assert loaded["f2"].merged_preview() == "曹尼玛：配色再淡一点"
+    assert loaded["f2"].merged_line(1) == "我：收到"
+    # 纯附件那一行摘要显示成 📎 文件名
+    assert MergedItem("我", "", "评审材料-v3.pdf").preview == "📎 评审材料-v3.pdf"
+    # 合并转发的会话摘要
+    assert loaded["f2"].preview_text == "【合并转发】2 条消息"
+    log.close()
+
+
+def test_bad_json_degrades():
+    """手改坏了的 JSON 不能让界面崩：降级成"没有引用 / 不是合并转发"。"""
+    log = ChatLog(":memory:")
+    log.save_message(_msg("b1", "坏数据", 100.0))
+    log._db.execute("UPDATE messages SET reply_to = '{不是合法 JSON', merged = '[[['")
+    log._db.commit()
+    loaded = log.load(CHAT)[0]
+    assert loaded.reply_to is None and loaded.merged_items == ()
+    assert not loaded.is_reply and not loaded.is_merged
+    assert reply_from_json(None) is None and reply_from_json("") is None
+    assert merged_from_json("{}") == () and merged_from_json(None) == ()
+    log.close()
+
+
+def test_pinned_messages_persist():
+    """置顶**可以多条**，每条带"仅我可见 / 双方可见"：存库读回都要保住。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mchat.db")
+        log = ChatLog(path)
+        for mid, ts in (("m1", 100.0), ("m2", 101.0), ("m3", 102.0)):
+            log.save_message(_msg(mid, f"第 {mid} 条", ts))
+        log.set_pinned_refs(CHAT, (PinRef("m2", True), PinRef("m1", False)))
+        assert log.pinned_refs() == {CHAT: (PinRef("m2", True), PinRef("m1", False))}
+        log.close()
+
+        again = ChatLog(path)                        # 重开：两条都在、范围标记也在
+        assert again.pinned_refs() == {CHAT: (PinRef("m2", True), PinRef("m1", False))}
+        again.set_pinned_refs(CHAT, (PinRef("m2", True),))    # 只留一条
+        assert again.pinned_refs() == {CHAT: (PinRef("m2", True),)}
+        again.set_pinned_refs(CHAT, ())              # 全取消
+        assert again.pinned_refs() == {}
+        again.set_pinned_refs(CHAT, (PinRef("m1"), PinRef("m3", True)))
+        assert again.clear_conversation(CHAT) == 3   # 清空会话 -> 置顶一起没
+        assert again.pinned_refs() == {}
+        assert again.load(CHAT) == []
+        again.close()
+
+
+def test_pinned_legacy_formats_read_back():
+    """这一列的老存法都要能读：单个裸 id（v3 第一版）、纯 id 数组（多条那版）、坏 JSON。"""
+    log = ChatLog(":memory:")
+    log.save_message(_msg("m1", "老库里的置顶", 100.0))
+    log.save_message(_msg("m2", "第二条", 101.0))
+
+    def write(raw: str) -> None:
+        log._db.execute(
+            "INSERT INTO chats(conversation_id, pinned_message_id) VALUES (?, ?) "
+            "ON CONFLICT(conversation_id) DO UPDATE SET pinned_message_id = excluded."
+            "pinned_message_id", (CHAT, raw))
+        log._db.commit()
+
+    write("m1")                                      # 老：单个裸 id
+    assert log.pinned_refs() == {CHAT: (PinRef("m1", False),)}
+    write('["m2", "m1"]')                            # 老：纯 id 数组（都当"仅我可见"）
+    assert log.pinned_refs() == {CHAT: (PinRef("m2", False), PinRef("m1", False))}
+    write('[{"id": "m1", "both": true}]')            # 新：带可见范围
+    assert log.pinned_refs() == {CHAT: (PinRef("m1", True),)}
+    write("[坏掉的 JSON")
+    assert log.pinned_refs() == {}                   # 坏数据降级成"没置顶"
     log.close()
 
 

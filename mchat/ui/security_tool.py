@@ -53,8 +53,11 @@ SPEC = {
 class SecurityToolWidget(QWidget):
     """转换器本体（无窗口边框，可直接嵌进对话框或测试）。"""
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, parent: QWidget | None = None, *, clipboard=None):
         super().__init__(parent)
+        # 剪贴板可注入：测试换成假实现，免得跑一次测试就把用户的剪贴板顶掉
+        self._clipboard = (clipboard if clipboard is not None
+                           else QApplication.clipboard())
         self.setObjectName("toolRoot")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedSize(QSize(620, 760))
@@ -245,8 +248,15 @@ class SecurityToolWidget(QWidget):
         self._refresh_texts()
 
     def _on_mode_changed(self, _mode: str) -> None:
+        """切"编码/解码"（或"加密/解密"）时**输入框里的字原样不动**。
+
+        以前这里会 `input_field.clear()`，于是"先编码、再切到解码对照一下"这种来回切
+        的动作，每切一次都得重新粘一遍；更别扭的是**切算法时也会误清** —— 切到 AES 要
+        把模式标签换成"加密/解密"，分段控件重新赋值会再发一次 valueChanged，就走到这里
+        把输入清掉了。现在只收掉上一轮的结果（输出框 + 提示），输入留着，
+        切过去直接回车就能算。清空输入依然是「清空」按钮的事。
+        """
         self._refresh_texts()
-        self.input_field.clear()
         self.clear_output()
         if not self._initializing:
             self.input_field.focus_field()
@@ -329,7 +339,7 @@ class SecurityToolWidget(QWidget):
         if not text:
             self.toast.show_message("还没有可复制的结果", "warning")
             return
-        QApplication.clipboard().setText(text)
+        self._clipboard.setText(text)
         self.toast.show_message(f"已复制 {len(text)} 个字符到剪贴板", "success")
 
     def clear_all(self) -> None:
@@ -402,13 +412,16 @@ class SecurityToolWidget(QWidget):
 class SecurityToolDialog(QDialog):
     """把工具箱装进一个非模态窗口：关掉不影响聊天，重复打开复用同一个实例。"""
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, parent: QWidget | None = None, *, clipboard=None):
         super().__init__(parent)
+        # 剪贴板可注入：测试换成假实现，免得跑测试就把用户的剪贴板顶掉
+        self._clipboard = (clipboard if clipboard is not None
+                           else QApplication.clipboard())
         self.setObjectName("toolDialog")
         self.setWindowTitle("安全工具箱 · MChat")
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
         self.setSizeGripEnabled(False)
-        self.tool = SecurityToolWidget(self)
+        self.tool = SecurityToolWidget(self, clipboard=self._clipboard)
         box = QVBoxLayout(self)
         box.setContentsMargins(0, 0, 0, 0)
         box.addWidget(self.tool)

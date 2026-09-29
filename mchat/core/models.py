@@ -5,12 +5,19 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Iterable
 
 __all__ = [
-    "ChatKind", "User", "Message", "Conversation", "ME_ID",
+    "ChatKind", "User", "Message", "Conversation", "Attachment", "ME_ID",
+    "ReplyRef", "MergedItem", "PinRef", "reply_to_json", "reply_from_json",
+    "pins_to_json", "pins_from_json",
+    "merged_to_json", "merged_from_json",
+    "IMAGE_SUFFIXES", "human_size",
     "format_clock", "format_day_label", "format_list_time",
     "same_day", "day_label_key",
 ]
@@ -68,8 +75,279 @@ def format_list_time(ts: float, now: float | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 附件（图片 / 文件）
+# ---------------------------------------------------------------------------
+# 图片后缀：用来决定"气泡里画缩略图"还是"画文件卡片"。这里按后缀判断，不读文件内容 ——
+# 数据层不导入 Qt，也不想为了判断类型去解码整张图。
+IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".jfif", ".gif", ".bmp",
+                            ".webp", ".tif", ".tiff", ".ico"})
+
+
+def human_size(size: int) -> str:
+    """字节数 -> ``1.2 MB`` / ``234 KB`` / ``512 B``（文件卡片上显示的那个）。"""
+    try:
+        value = float(max(0, int(size)))
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            text = f"{value:.0f}" if unit == "B" else f"{value:.1f}"
+            return f"{text.replace('.0', '')} {unit}"
+        value /= 1024
+    return f"{value:.0f} GB"          # pragma: no cover - 循环里已经 return
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """消息里的附件。
+
+    单机演示没有服务器，所以**只记本地路径**，不搬文件、不上传（真联网时这一层要换成
+    "先上传拿到远端 id，再随消息发出"）。真正跨进程传输的三个字段是
+    ``path`` / ``name`` / ``size``：落库时序列化成 JSON 存一列，读回来原样还原。
+
+    ``name`` 和 ``size`` 都可以从路径推出来，但显式存下来更稳：文件被移走/改名以后，
+    气泡上的文件卡片还能显示原来的名字和大小（不会变成"未知"）。
+    """
+
+    path: str
+    name: str = ""
+    size: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            object.__setattr__(self, "name", os.path.basename(self.path) or "附件")
+        if not self.size:
+            try:                       # 文件不在就当大小未知（不是错误，别让它抛）
+                object.__setattr__(self, "size", os.path.getsize(self.path))
+            except OSError:
+                pass
+
+    # ---------------------------------------------------------------- 构造
+    @classmethod
+    def from_path(cls, path: str) -> "Attachment":
+        """从本地路径造一个附件（绝对路径：存进库里的路径要经得起换 cwd）。"""
+        return cls(path=os.path.abspath(str(path)))
+
+    # ---------------------------------------------------------------- 查询
+    @property
+    def suffix(self) -> str:
+        """``.pdf`` / ``.png``（全是小写，没有后缀就是空串）。"""
+        return os.path.splitext(self.name)[1].lower()
+
+    @property
+    def ext(self) -> str:
+        """``PDF`` / ``PNG``（文件卡片上那一行用）。"""
+        return self.suffix.lstrip(".").upper()
+
+    @property
+    def is_image(self) -> bool:
+        return self.suffix in IMAGE_SUFFIXES
+
+    @property
+    def kind(self) -> str:
+        """``image`` 或 ``file`` —— 界面据此决定画缩略图还是文件卡片。"""
+        return "image" if self.is_image else "file"
+
+    @property
+    def label(self) -> str:
+        """没有配文时消息的摘要（会话列表 / 通知里用）。"""
+        return "📷 照片" if self.is_image else f"📎 {self.name}"
+
+    @property
+    def size_text(self) -> str:
+        """``1.2 MB``；大小未知时是空串（别显示 "0 B" 骗人）。"""
+        return human_size(self.size) if self.size > 0 else ""
+
+    @property
+    def exists(self) -> bool:
+        """文件还在不在本地（被删/被移走时界面要能优雅降级）。"""
+        return bool(self.path) and os.path.isfile(self.path)
+
+    # ---------------------------------------------------------------- 序列化
+    def to_json(self) -> dict:
+        return {"path": self.path, "name": self.name, "size": self.size}
+
+    @classmethod
+    def from_json(cls, data) -> "Attachment | None":
+        """从落库的字典还原；字段乱七八糟时返回 ``None``（别让坏数据炸开界面）。"""
+        if not isinstance(data, dict):
+            return None
+        path = str(data.get("path") or "")
+        if not path:
+            return None
+        try:
+            size = int(data.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        return cls(path=path, name=str(data.get("name") or ""), size=size)
+
+    def dump(self) -> str:
+        """给 SQLite 用的 JSON 字符串（中文名不转义，库文件里看着就是原名）。"""
+        return json.dumps(self.to_json(), ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
 # 模型
 # ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ReplyRef:
+    """被引用（回复）的那条消息的快照。
+
+    为什么连作者和摘要一起存，而不是只存一个 message_id 去查：被引用的那条可能被
+    撤回、或者整个会话被清空，那时候气泡上的引用块还得照常显示 —— 快照存的是
+    "我当时回的是哪句话"。
+    """
+
+    message_id: str
+    author: str
+    preview: str
+
+    def to_json(self) -> dict:
+        return {"id": self.message_id, "author": self.author, "preview": self.preview}
+
+    @classmethod
+    def from_json(cls, data) -> "ReplyRef | None":
+        """坏数据降级成 None（老库、手改过的库都不该把界面搞崩）。"""
+        if not isinstance(data, dict):
+            return None
+        message_id = str(data.get("id", "")).strip()
+        if not message_id:
+            return None
+        return cls(message_id, str(data.get("author", "")), str(data.get("preview", "")))
+
+    @property
+    def text(self) -> str:
+        """一行字：``作者：摘要``（群聊里一眼能看出回的是谁）。"""
+        return f"{self.author}：{self.preview}" if self.author else self.preview
+
+
+def reply_to_json(reply: "ReplyRef | None") -> str | None:
+    """存库用：没有引用就存 NULL（而不是空 JSON，便于用 IS NULL 判断）。"""
+    return json.dumps(reply.to_json(), ensure_ascii=False) if reply is not None else None
+
+
+def reply_from_json(data) -> "ReplyRef | None":
+    if data in (None, "", b""):
+        return None
+    try:
+        return ReplyRef.from_json(json.loads(data))
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class PinRef:
+    """一条会话内置顶：**哪条消息** + **是不是"对方也置顶"**（Telegram 的两个选项）。
+
+    ``for_both=False`` 就是"仅为我置顶"：只有我这边看得到这条置顶横幅，对方那边什么都没有。
+    """
+
+    message_id: str
+    for_both: bool = False
+
+    def to_json(self) -> dict:
+        return {"id": self.message_id, "both": self.for_both}
+
+    @classmethod
+    def from_json(cls, data) -> "PinRef | None":
+        """兼容三种存法：``{"id":..,"both":..}`` / 纯 id 字符串 / 直接一个 id。"""
+        if isinstance(data, dict):
+            message_id = str(data.get("id", "")).strip()
+            if not message_id:
+                return None
+            return cls(message_id, bool(data.get("both", False)))
+        if isinstance(data, str) and data.strip():
+            return cls(data.strip(), False)
+        return None
+
+    @property
+    def label(self) -> str:
+        """界面上那一小行说明（横幅上会显示）。"""
+        return "双方可见" if self.for_both else "仅我可见"
+
+
+def pins_to_json(pins: Iterable["PinRef"]) -> str:
+    pins = tuple(pins)
+    if not pins:
+        return ""
+    return json.dumps([pin.to_json() for pin in pins], ensure_ascii=False)
+
+
+def pins_from_json(data) -> tuple["PinRef", ...]:
+    """坏数据降级成空元组；老库里的"单个 id / 纯 id 数组"也认。"""
+    if not data:
+        return ()
+    if isinstance(data, str):
+        text = data.strip()
+        if not text:
+            return ()
+        if not text.startswith("["):
+            return (PinRef(text, False),)          # v3 第一版：就存了一个 id
+        try:
+            loaded = json.loads(text)
+        except (TypeError, ValueError):
+            return ()
+    else:
+        loaded = data
+    if not isinstance(loaded, (list, tuple)):
+        return ()
+    found = (PinRef.from_json(entry) for entry in loaded)
+    return tuple(pin for pin in found if pin is not None)
+
+
+@dataclass(frozen=True)
+class MergedItem:
+    """"合并转发"里的一条：作者 + 内容（正文或附件名）+ 时间。
+
+    ``clock`` 是转发时把**原消息的时间**抄下来的（"14:05"）：查看窗口按 QQ 的样子
+    逐条列出来，每条配个时间才像聊天记录。老数据没有这个字段就留空。
+    """
+
+    author: str
+    text: str
+    attachment: str = ""
+    clock: str = ""
+
+    def to_json(self) -> dict:
+        return {"author": self.author, "text": self.text,
+                "attachment": self.attachment, "clock": self.clock}
+
+    @classmethod
+    def from_json(cls, data) -> "MergedItem | None":
+        if not isinstance(data, dict):
+            return None
+        return cls(str(data.get("author", "")), str(data.get("text", "")),
+                   str(data.get("attachment", "")), str(data.get("clock", "")))
+
+    @property
+    def preview(self) -> str:
+        """这一条在摘要里长什么样。"""
+        if self.text.strip():
+            return self.text
+        return f"📎 {self.attachment}" if self.attachment else "（空消息）"
+
+
+def merged_to_json(items: Iterable["MergedItem"]) -> str:
+    items = tuple(items)
+    if not items:
+        return ""
+    return json.dumps([item.to_json() for item in items], ensure_ascii=False)
+
+
+def merged_from_json(data) -> tuple["MergedItem", ...]:
+    """坏数据降级成空元组：宁可当成一条普通消息，也不要让界面炸掉。"""
+    if not data:
+        return ()
+    try:
+        loaded = json.loads(data)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(loaded, list):
+        return ()
+    return tuple(item for item in (MergedItem.from_json(entry) for entry in loaded)
+                 if item is not None)
+
+
 @dataclass(frozen=True)
 class User:
     """参与者。单机演示里没有账号体系，``id`` 就是稳定标识。"""
@@ -99,7 +377,11 @@ class User:
 
 @dataclass
 class Message:
-    """一条消息。``outgoing`` 表示由"我"发出（决定气泡靠哪边、什么颜色）。"""
+    """一条消息。
+
+    ``outgoing`` 表示由"我"发出（决定气泡靠哪边、什么颜色）；``attachment`` 是随消息
+    一起发出去的图片/文件（可以是纯附件、也可以带一段配文 ``text``）。
+    """
 
     id: str
     conversation_id: str
@@ -108,6 +390,10 @@ class Message:
     ts: float
     outgoing: bool = False
     status: str = "sent"          # sent / read，供气泡上的对勾使用
+    attachment: Attachment | None = None
+    reply_to: "ReplyRef | None" = None            # 回复：被引用那条的快照
+    forwarded_from: str = ""                      # 转发自哪个会话（空 = 不是转发）
+    merged_items: tuple[MergedItem, ...] = ()     # 合并转发的内容（非空 = 这是一条合并转发）
 
     @property
     def time_text(self) -> str:
@@ -116,6 +402,75 @@ class Message:
     @property
     def is_read(self) -> bool:
         return self.status == "read"
+
+    @property
+    def is_reply(self) -> bool:
+        return self.reply_to is not None
+
+    @property
+    def send_text(self) -> str:
+        """真正"发出去"的正文。
+
+        合并转发自己没有 ``text``（内容在 ``merged_items`` 里），而传输层是拿 ``text``
+        判"这是不是空消息"的 —— 空消息既不触发对方"正在输入…"，也不给已读回执。
+        所以这里给它一句摘要当载荷，免得转发出去的东西在对面看来"什么都没送到"
+        （纯附件消息仍然返回空串：那种情况由 ``attachment`` 证明它不是空的）。
+        """
+        if self.text.strip():
+            return self.text
+        if self.is_merged:
+            return f"【合并转发】{self.merged_count} 条消息"
+        return ""
+
+    @property
+    def is_forwarded(self) -> bool:
+        return bool(self.forwarded_from) and not self.merged_items
+
+    @property
+    def is_merged(self) -> bool:
+        """"合并转发"：一条气泡里装着好几条消息。"""
+        return bool(self.merged_items)
+
+    @property
+    def merged_count(self) -> int:
+        return len(self.merged_items)
+
+    def merged_line(self, index: int) -> str:
+        """"作者：内容" —— 查看窗口里的一行。"""
+        item = self.merged_items[index]
+        return f"{item.author}：{item.preview}" if item.author else item.preview
+
+    def merged_preview(self, limit: int = 32) -> str:
+        """卡片上那一行摘要：拿第一条的"作者：内容"（QQ 的聊天记录卡片就是这样）。
+
+        只给一行 —— 内容都塞进卡片会又长又难读，想看全部点开查看窗口。
+        """
+        if not self.merged_items:
+            return ""
+        text = " ".join(self.merged_line(0).split())
+        if len(text) > limit:
+            text = text[:limit - 1] + "…"
+        return text
+
+    @property
+    def kind(self) -> str:
+        """``text`` / ``image`` / ``file`` —— 界面按这个选气泡内容。"""
+        if self.attachment is None:
+            return "text"
+        return self.attachment.kind
+
+    @property
+    def has_attachment(self) -> bool:
+        return self.attachment is not None
+
+    @property
+    def preview_text(self) -> str:
+        """列表摘要：有配文就用配文，纯附件就用"📷 照片 / 📎 文件名"。"""
+        if self.is_merged:
+            return f"【合并转发】{self.merged_count} 条消息"
+        if self.text.strip():
+            return self.text
+        return self.attachment.label if self.attachment is not None else ""
 
 
 @dataclass
@@ -129,6 +484,9 @@ class Conversation:
     messages: list[Message] = field(default_factory=list)
     pinned: bool = False
     muted: bool = False          # 免打扰：未读不计数、徽标变灰（侧栏右键菜单里切）
+    # 会话内的置顶（**可以多条**）。排在最前的是最近置顶的：横幅先显示它，用 ‹ › 翻。
+    # 每条是个 PinRef：带"仅我可见 / 双方可见"这个标记。
+    pins: tuple[PinRef, ...] = ()
 
     # ---------------------------------------------------------------- 查询
     @property
@@ -145,6 +503,17 @@ class Conversation:
             if user.id == user_id:
                 return user
         return None
+
+    @property
+    def peer_name(self) -> str:
+        """单聊里"对方"的名字（群聊没有具体的某个人，返回空串）。
+
+        置顶小窗上那句「也为 XX 置顶」的 XX 就是它；群聊里换成"所有群成员"。
+        """
+        for member in self.members:
+            if not member.is_me:
+                return member.name
+        return ""
 
     def sender_name(self, message: Message) -> str:
         user = self.member(message.sender_id)
@@ -171,11 +540,15 @@ class Conversation:
 
     # ---------------------------------------------------------- 列表预览文案
     def preview_text(self) -> str:
-        """会话列表里的最后一条摘要；群聊带发送者前缀（Telegram 的做法）。"""
+        """会话列表里的最后一条摘要；群聊带发送者前缀（Telegram 的做法）。
+
+        纯附件消息（没有配文）在这里显示成"📷 照片 / 📎 文件名"，所以取的是
+        :attr:`Message.preview_text` 而不是裸的 ``text``。
+        """
         last = self.last_message
         if last is None:
             return "还没有消息"
-        text = " ".join(last.text.split())
+        text = " ".join(last.preview_text.split())
         if self.is_group and not last.outgoing:
             text = f"{self.sender_name(last)}: {text}"
         elif last.outgoing:

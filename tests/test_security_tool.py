@@ -33,9 +33,27 @@ from ui_probe import glyph_pixels, pump, wait_for                           # no
 ARTIFACTS = os.path.join(ROOT, "artifacts")
 
 
+
+class FakeClipboard:
+    """假剪贴板：只记下被写进来的东西，**不碰系统剪贴板**。
+
+    产品代码里"复制"是写系统剪贴板的；测试如果直接调用它，每跑一次就会把用户
+    剪贴板里的东西顶掉（这事儿真发生过）。所以测试统一换成这个假实现。
+    """
+
+    def __init__(self) -> None:
+        self.text_value = ""
+
+    def setText(self, text) -> None:                     # noqa: N802
+        self.text_value = str(text)
+
+    def text(self) -> str:
+        return self.text_value
+
 def main() -> int:
     app = QApplication.instance() or QApplication([])
-    dialog = SecurityToolDialog()
+    clipboard = FakeClipboard()
+    dialog = SecurityToolDialog(clipboard=clipboard)
     dialog.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
     dialog.apply_palette(DARK)
     dialog.show()
@@ -82,12 +100,19 @@ def main() -> int:
 
     win.copy_output()
     pump(app, 120)
-    check("复制到剪贴板", QApplication.clipboard().text() == expected)
+    check("复制到剪贴板（写的是注入的那个剪贴板）",
+          clipboard.text() == expected, repr(clipboard.text()))
 
-    # --- Base64 解码（含模式切换清空） ------------------------------------
+    # --- Base64 解码（切换模式保留输入） ----------------------------------
     win.select_mode(1)
-    pump(app)
-    check("切换模式后清空输入", win.input_field.text() == "", win.input_field.text())
+    pump(app, 200)
+    check("切换模式后输入框内容原样保留",
+          win.input_field.text() == sample, f"'{win.input_field.text()}'")
+    check("切换模式后字符计数也跟着留着",
+          win.counter_label.text() == f"{len(sample)} 字符", win.counter_label.text())
+    check("切换模式后上一轮结果被收掉（标签落回提示）",
+          win.output_text() == "" and win.output_field.label_text() == "结果会显示在这里",
+          f"'{win.output_text()}' / {win.output_field.label_text()}")
     check("切换模式后按钮文案联动", win.action_btn.text() == "执 行 解 码",
           win.action_btn.text())
     win.set_input("这不是 Base64!!!")
@@ -112,6 +137,13 @@ def main() -> int:
           str(win.key_section.maximumHeight()))
     check("AES 模式按钮文案", win.action_btn.text() == "执 行 加 密", win.action_btn.text())
     pump(app, 200)
+    # 需求回归：两种方式（Base64 / AES-256）互相切换时，输入框里的字符保留不变。
+    # 切算法会把模式标签整套换掉（编码/解码 -> 加密/解密），分段控件重新赋值会再发一次
+    # valueChanged，以前就是这一下把输入框清空的。
+    check("Base64 → AES-256：输入框里的字一个没少",
+          win.input_field.text() == expected, f"'{win.input_field.text()}'")
+    check("切过去后按键计数也还在（不是只剩个空框）",
+          win.counter_label.text() == f"{len(expected)} 字符", win.counter_label.text())
 
     win.set_input("绝密消息", "口令123")
     win.execute()
@@ -120,6 +152,26 @@ def main() -> int:
     check("AES 加密结果可自解", crypto.aes_decrypt(cipher, "口令123") == "绝密消息")
     check("加密结果为随机 IV 格式", crypto.detect_format(cipher).name == "MChat v1 格式")
     check("加密提示含随机 IV", "随机 IV" in win.status_text(), win.status_text())
+
+    win.select_algorithm(0)                    # 切回 Base64
+    pump(app, 320)
+    check("AES-256 → Base64：输入框里的字依然原样保留",
+          win.input_field.text() == "绝密消息", f"'{win.input_field.text()}'")
+    # 收起是动画：断言"收干净了"必须等落定，不能拿固定 pump 后的 maximumHeight() 卡 0
+    # （机器忙的时候折叠还没跑完，这一条会偶发翻车）
+    check("切回 Base64 后密钥区收起",
+          wait_for(app, lambda: win.key_section.maximumHeight() == 0),
+          str(win.key_section.maximumHeight()))
+    check("切回 Base64 后选项换回编码/解码",
+          win.mode_seg.options() == ["编码", "解码"], str(win.mode_seg.options()))
+    check("切方式只收结果，不动输入（输出框清空 + 标签落回提示）",
+          win.output_text() == "" and win.output_field.label_text() == "结果会显示在这里",
+          f"'{win.output_text()}' / {win.output_field.label_text()}")
+    win.select_algorithm(1)                    # 后面的用例接着按 AES 走
+    win.set_input("绝密消息", "口令123")
+    win.execute()
+    pump(app)
+    cipher = win.output_text()
 
     # --- AES 解密 + 错误密钥 ---------------------------------------------
     win.select_mode(1)

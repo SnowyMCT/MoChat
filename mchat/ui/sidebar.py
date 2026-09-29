@@ -1,8 +1,8 @@
-"""左侧会话列表：标题栏（含工具箱入口）、搜索框、会话条目、主题切换。"""
+"""左侧会话列表：标题栏（工具箱 + 设置入口）、搜索框、会话条目、主题切换。"""
 from __future__ import annotations
 
-from PyQt6.QtCore import (QEasingCurve, QPropertyAnimation, QSize, Qt,
-                          pyqtProperty, pyqtSignal)
+from PyQt6.QtCore import (QEasingCurve, QPropertyAnimation, Qt, pyqtProperty,
+                          pyqtSignal)
 from PyQt6.QtGui import QColor, QFontMetrics, QPainter
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QScrollArea,
                              QSizePolicy, QToolButton, QVBoxLayout, QWidget)
@@ -273,7 +273,7 @@ class Sidebar(QWidget):
     conversationSelected = pyqtSignal(str)
     conversationMenuRequested = pyqtSignal(str, object)   # (会话id, 全局坐标)
     toolRequested = pyqtSignal()
-    menuRequested = pyqtSignal()
+    settingsRequested = pyqtSignal()                      # 点齿轮：开设置区域
     themeChanged = pyqtSignal(str)
 
     def __init__(self, store: ChatStore, parent=None):
@@ -319,8 +319,9 @@ class Sidebar(QWidget):
         self.tool_btn.setMinimumHeight(30)
         self.tool_btn.clicked.connect(self.toolRequested)
 
-        self.more_btn = IconButton("more", self, tooltip="更多")
-        self.more_btn.clicked.connect(self.menuRequested)
+        # 设置入口：主题 / 文字大小 / 动效都收在那一个窗口里（Ctrl+, 同效）
+        self.settings_btn = IconButton("gear", self, tooltip="设置：主题 / 文字大小 / 动效（Ctrl+,）")
+        self.settings_btn.clicked.connect(self.settingsRequested)
 
         row = QHBoxLayout()
         row.setSpacing(6)
@@ -329,7 +330,7 @@ class Sidebar(QWidget):
         row.addWidget(self.total_badge)
         row.addStretch(1)
         row.addWidget(self.tool_btn)
-        row.addWidget(self.more_btn)
+        row.addWidget(self.settings_btn)
         return row
 
     def _build_search(self) -> QWidget:
@@ -463,7 +464,7 @@ class Sidebar(QWidget):
         self.search_field.apply_palette(palette)
         self.theme_seg.apply_palette(palette)
         self.tool_btn.setIcon(make_icon("apps", palette.accent, 16))
-        self.more_btn.set_icon_color(palette.muted)
+        self.settings_btn.set_icon_color(palette.muted)
         for item in self._items.values():
             item.apply_palette(palette)
 

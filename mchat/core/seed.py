@@ -3,6 +3,10 @@
 界面启动时若没有真实传输层（还没有联网版），就用这里的例子把界面填满，
 保证打开就能看到一个像模像样的聊天窗口。所有时间戳都相对"现在"生成，
 所以日期分隔条永远显示"今天 / 昨天"，不会随日期跑偏。
+
+演示数据里还带两条**附件消息**（一张图片 + 一个 PDF），素材是
+``tools/build_demo_assets.py`` 生成、提交在仓库里的：这样打开程序就能看到
+"图片消息 / 文件消息"长什么样，也能看到"对方发来的图片"（LIN 的自动回复带一张图）。
 """
 from __future__ import annotations
 
@@ -10,7 +14,8 @@ import itertools
 import time
 from dataclasses import dataclass
 
-from .models import ChatKind, Conversation, ME_ID, Message, User
+from . import assets as demo_assets
+from .models import Attachment, ChatKind, Conversation, ME_ID, Message, User
 from .store import ChatStore
 from .transport import ReplyScript
 
@@ -50,7 +55,8 @@ def _builder():
     counter = itertools.count(1)
 
     def make(conversation_id: str, sender: User, text: str, ts: float,
-             *, status: str = "sent") -> Message:
+             *, status: str = "sent",
+             attachment: Attachment | None = None) -> Message:
         return Message(
             id=f"m{next(counter)}",
             conversation_id=conversation_id,
@@ -59,9 +65,17 @@ def _builder():
             ts=ts,
             outgoing=sender.is_me,
             status=status,
+            attachment=attachment,
         )
 
     return make
+
+
+def demo_attachment(name: str) -> Attachment | None:
+    """演示素材里的一个附件；素材不在（没跑生成脚本）就返回 None，不报错。"""
+    if not demo_assets.demo_exists(name):
+        return None
+    return Attachment.from_path(demo_assets.demo_path(name))
 
 
 def _day_anchor(now: float, days_back: int) -> float:
@@ -83,13 +97,17 @@ def build_demo(now: float | None = None) -> Demo:
     yesterday = lambda h, m: at(1, h, m)      # noqa: E731
     days_ago = lambda d, h, m: at(d, h, m)    # noqa: E731
     make = _builder()
+    # 演示附件（素材缺失会是 None，消息就退化成普通文本）
+    photo = demo_attachment(demo_assets.DEMO_PHOTO)
+    report = demo_attachment(demo_assets.DEMO_REPORT)
 
     lin = Conversation(id=CHAT_LIN, title=LIN.name, kind=ChatKind.DIRECT,
                        members=[ME, LIN], pinned=True)
     lin.messages = [
         make(CHAT_LIN, LIN, "周五那份评审材料我先过一遍，看有没有漏的。", yesterday(17, 42)),
         make(CHAT_LIN, ME, "好，我这边把流程图补上再发你。", yesterday(17, 45), status="read"),
-        make(CHAT_LIN, LIN, "文件我放共享盘了，命名是 review-v3-final。", yesterday(17, 58)),
+        make(CHAT_LIN, LIN, "文件我放共享盘了，命名是 review-v3-final。", yesterday(17, 58),
+             attachment=report),
         make(CHAT_LIN, LIN, "你有空看下最后一节，那部分我拿不准。", yesterday(18, 2)),
     ]
 
@@ -106,6 +124,8 @@ def build_demo(now: float | None = None) -> Demo:
     design = Conversation(id=CHAT_DESIGN, title="尼玛一家", kind=ChatKind.GROUP,
                           members=[ME, SU, LIN])
     design.messages = [
+        make(CHAT_DESIGN, SU, "先看这张：暮色那版的主视觉，我按你上次说的把对比降了一点。",
+             days_ago(1, 16, 18), attachment=photo),
         make(CHAT_DESIGN, SU, "新的配色方案放在 Figma 里了，大家看看。", days_ago(1, 16, 20)),
         make(CHAT_DESIGN, ME, "深色那套不错，层次比上一版清楚。", days_ago(1, 16, 26), status="read"),
         make(CHAT_DESIGN, SU, "嗯，我再把按钮的圆角统一一下。", days_ago(1, 16, 31)),
@@ -139,11 +159,14 @@ def build_demo(now: float | None = None) -> Demo:
 
     scripts = {
         CHAT_LIN: ReplyScript(LIN.id, (
+            "截图我发你了，对着看。",
             "好，我看完回你 👍",
             "嗯，这份我来跟。",
             "行，那就这么定了。",
             "刚想起来，还有个细节要补。",
-        ), latency=1.6),
+        ), latency=1.6,
+            # 第一次回复带一张图：本机就能演示"收到别人发来的图片消息"
+            attachments=tuple(a for a in (photo,) if a is not None)),
         CHAT_GROUP: ReplyScript(ZHOU.id, (
             "同意。",
             "我这边没问题。",

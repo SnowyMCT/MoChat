@@ -249,18 +249,15 @@ class SearchDialog(QDialog):
     # ------------------------------------------------------------------ 内部
     def _show_idle_hint(self) -> None:
         if self._scope_id:
-            self.hint.setText(f"在「{self.scope_title()}」里搜索：输入关键词开始"
-                              "　·　也可以切到「全部会话」")
+            self.hint.setText(f"在「{self.scope_title()}」里搜索：输入关键词开始")
         else:
-            self.hint.setText("输入关键词开始搜索：跨全部会话，命中本地历史库的索引"
-                              if not self._current_id else
-                              "输入关键词开始搜索全部会话　·　切到「仅当前会话」只看这一个")
+            self.hint.setText("输入关键词开始搜索")
 
     def _apply_scope_labels(self) -> None:
         self.setWindowTitle(f"搜索 · {self.scope_title()}")
         self.search_field.set_label(
             f"在「{self.scope_title()}」里搜索消息" if self._scope_id
-            else "搜索全部消息（中文或英文，例如 日本 / telegram）")
+            else "搜索全部消息")
 
     def _on_scope_control(self, value: str) -> None:
         """分段控件：切到"仅当前会话"就收窄到主窗口开着的会话。"""

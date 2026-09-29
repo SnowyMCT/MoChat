@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from PyQt6.QtCore import Qt
@@ -23,6 +24,77 @@ THEME_LIGHT = "亮色"
 THEME_DARK = "暗色"
 THEME_SYSTEM = "跟随系统"
 THEME_OPTIONS = (THEME_LIGHT, THEME_DARK, THEME_SYSTEM)
+
+
+# ---------------------------------------------------------------------------
+# 文字大小（全局字号缩放）
+# ---------------------------------------------------------------------------
+# 界面上的字号几乎都写在 QSS 的 font-size 里（气泡、会话列表、按钮、菜单、对话框…），
+# 所以"文字大小"这一项做成一件事就够：**把生成好的样式表里每个 font-size 乘一个系数**。
+# 一处实现 = 全局一致，不会出现"气泡变大了、侧栏没变"这种半吊子效果；
+# 少数写死在代码里的字号（悬浮标签的磅值、预览文字）另外按同一个系数算。
+FONT_SCALES: tuple[tuple[str, float], ...] = (
+    ("小", 0.88), ("标准", 1.0), ("大", 1.14), ("特大", 1.28),
+)
+FONT_SCALE_LABELS = tuple(label for label, _ in FONT_SCALES)
+FONT_SCALE_MIN = min(scale for _, scale in FONT_SCALES)
+FONT_SCALE_MAX = max(scale for _, scale in FONT_SCALES)
+
+_FONT_PX = re.compile(r"font-size:\s*([0-9]*\.?[0-9]+)px")
+_font_scale = 1.0
+
+
+def clamp_font_scale(scale) -> float:
+    """把任意输入夹到允许范围内（坏值回落成 1.0），设置项不可信。"""
+    try:
+        value = float(scale)
+    except (TypeError, ValueError):
+        return 1.0
+    if value != value:                      # NaN
+        return 1.0
+    return max(FONT_SCALE_MIN, min(FONT_SCALE_MAX, value))
+
+
+def set_font_scale(scale) -> float:
+    """设当前字号系数，返回实际生效的值（各部件下次重建样式表/应用调色板时生效）。"""
+    global _font_scale
+    _font_scale = clamp_font_scale(scale)
+    return _font_scale
+
+
+def font_scale() -> float:
+    return _font_scale
+
+
+def scale_of(label: str) -> float:
+    """档位名（"大"）-> 系数；认不出来就是标准。"""
+    for name, value in FONT_SCALES:
+        if name == label:
+            return value
+    return 1.0
+
+
+def label_of(scale) -> str:
+    """系数 -> 最近的档位名（存的是数字，界面要显示档位）。"""
+    value = clamp_font_scale(scale)
+    return min(FONT_SCALES, key=lambda item: abs(item[1] - value))[0]
+
+
+def scale_font_sizes(qss: str, scale) -> str:
+    """把样式表里所有 ``font-size: Npx`` 乘上系数。
+
+    系数是 1 就原样返回（别做无谓的字符串重写，GSS 文本好比对、测试好断言）。
+    """
+    factor = clamp_font_scale(scale)
+    if abs(factor - 1.0) < 1e-9:
+        return qss
+
+    def replace(match: re.Match) -> str:
+        size = float(match.group(1)) * factor
+        text = f"{size:.2f}".rstrip("0").rstrip(".")
+        return f"font-size: {text}px"
+
+    return _FONT_PX.sub(replace, qss)
 
 
 @dataclass(frozen=True)
@@ -125,9 +197,9 @@ def watch_system_palette(callback) -> None:
         signal.connect(lambda *_: callback())
 
 
-def menu_qss(p: Palette) -> str:
+def menu_qss(p: Palette, *, scale: float | None = None) -> str:
     """右键/下拉菜单的样式（菜单是独立顶层控件，不吃主窗口的样式表）。"""
-    return f"""
+    qss = f"""
     QMenu {{
         background-color: {p.card};
         border: 1px solid {p.border};
@@ -144,11 +216,12 @@ def menu_qss(p: Palette) -> str:
     QMenu::item:disabled {{ color: {p.muted}; }}
     QMenu::separator {{ height: 1px; background: {p.border}; margin: 5px 8px; }}
     """
+    return scale_font_sizes(qss, font_scale() if scale is None else scale)
 
 
-def build_qss(p: Palette) -> str:
-    """生成整套静态样式表。"""
-    return f"""
+def build_qss(p: Palette, *, scale: float | None = None) -> str:
+    """生成整套静态样式表（字号按当前"文字大小"设置整体缩放）。"""
+    qss = f"""
     QWidget {{ font-family: {FONT_STACK}; }}
     QWidget#root, QWidget#toolRoot, QDialog {{ color: {p.text}; }}
 
@@ -266,6 +339,44 @@ def build_qss(p: Palette) -> str:
         font-size: 13.5px;
         padding: 0px;
     }}
+
+    /* -------------------------------------------------------- 附件 -- */
+    /* 待发送条（输入栏上方）：缩略图/文件图标 + 名字 + 大小 + ✕ */
+    QWidget#attachTray {{
+        background-color: {p.card_alt};
+        border-top: 1px solid {p.border};
+    }}
+    QLabel#attachThumb {{
+        border: 1px solid {p.border};
+        border-radius: 8px;
+        background-color: {p.card};
+    }}
+    QLabel#attachName {{ font-size: 12.5px; font-weight: 600; color: {p.text}; }}
+    QLabel#attachMeta {{ font-size: 11px; color: {p.muted}; }}
+    /* 气泡里的图片：等比缩放后的缩略图，点一下用系统看图器打开 */
+    QLabel#imagePreview {{
+        border: 1px solid {p.border};
+        border-radius: 10px;
+        background-color: {p.card_alt};
+        color: {p.muted};
+        font-size: 12px;
+        padding: 10px;
+    }}
+    /* 气泡里的文件卡片：图标 + 文件名 + 类型/大小 */
+    QFrame#fileCard {{
+        background-color: {p.card_alt};
+        border: 1px solid {p.border};
+        border-radius: 10px;
+    }}
+    /* 自己发出去的气泡底色本身就是主题色/浅绿，卡片改用半透明白，两种主题都压得住 */
+    QFrame#bubbleOut QFrame#fileCard {{
+        background-color: rgba(255, 255, 255, 0.42);
+        border: 1px solid rgba(255, 255, 255, 0.55);
+    }}
+    QLabel#fileName {{ font-size: 12.5px; font-weight: 600; color: {p.text}; }}
+    QLabel#fileMeta {{ font-size: 11px; color: {p.muted}; }}
+    QFrame#bubbleOut QLabel#fileName {{ color: {p.bubble_out_text}; }}
+    QFrame#bubbleOut QLabel#fileMeta {{ color: {p.bubble_out_text}; }}
 
     /* ---------------------------------------------------- 表情面板 -- */
     QWidget#emojiPanel {{
@@ -409,4 +520,141 @@ def build_qss(p: Palette) -> str:
         font-family: {FONT_STACK};
         font-size: 12px;
     }}
+
+    /* -------------------------------------------- 回复 / 转发 / 置顶 -- */
+    /* 气泡里的引用块（回复）：左边一根竖条 + 两行小字，整块可以点，跳到原消息 */
+    QFrame#quoteBox {{
+        background-color: {p.track};
+        border: none;
+        border-left: 3px solid {p.accent};
+        border-radius: 6px;
+    }}
+    QFrame#bubbleOut QFrame#quoteBox {{ background-color: rgba(255, 255, 255, 0.42); }}
+    QLabel#quoteAuthor {{ font-size: 11.5px; font-weight: 700; color: {p.accent}; }}
+    QLabel#quoteText {{ font-size: 11.5px; color: {p.muted}; }}
+    QFrame#bubbleOut QLabel#quoteText {{ color: {p.bubble_out_text}; }}
+    /* "转发自 X" 的小字（Telegram 的 Forwarded from） */
+    QLabel#forwardCaption {{ font-size: 11.5px; font-weight: 600; color: {p.accent}; }}
+    /* 合并转发：一张卡片，列出前几条，点一下展开全部 */
+    QFrame#mergedCard {{
+        background-color: {p.track};
+        border: none;
+        border-left: 3px solid {p.accent};
+        border-radius: 8px;
+    }}
+    QFrame#bubbleOut QFrame#mergedCard {{ background-color: rgba(255, 255, 255, 0.42); }}
+    QLabel#mergeTitle {{ font-size: 12.5px; font-weight: 700; color: {p.accent}; }}
+    QLabel#mergePreview {{ font-size: 12px; color: {p.text}; }}
+    QFrame#bubbleOut QLabel#mergePreview {{ color: {p.bubble_out_text}; }}
+    QLabel#mergeFooter {{ font-size: 11px; color: {p.muted}; }}
+    /* "聊天记录"查看窗口（合并转发点开之后） */
+    QDialog#mergedViewerRoot {{ background-color: {p.surface}; }}
+    QLabel#mergedViewTitle {{ font-size: 15px; font-weight: 700; color: {p.text}; }}
+    QLabel#mergedViewSubtitle {{ font-size: 12px; color: {p.muted}; }}
+    QWidget#mergedViewHost, QScrollArea#mergedViewArea {{ background: transparent; }}
+    QWidget#mergedRow {{ background: transparent; }}
+    QLabel#mergedNick {{ font-size: 12px; color: {p.accent}; font-weight: 600; }}
+    QLabel#mergedClock {{ font-size: 11px; color: {p.muted}; }}
+    QFrame#mergedBubble {{
+        background-color: {p.card};
+        border: 1px solid {p.border};
+        border-radius: 10px;
+    }}
+    QLabel#mergedBody {{ font-size: 12.5px; color: {p.text}; }}
+    QLabel#mergedAttach {{ font-size: 12px; color: {p.accent}; }}
+    /* 选中态：整条气泡描一圈主题色 */
+    QFrame#bubbleIn[selected="true"], QFrame#bubbleOut[selected="true"] {{
+        border: 1px solid {p.accent};
+    }}
+    /* 批量操作条：贴在输入栏上方 */
+    QWidget#selectBar {{
+        background-color: {p.card};
+        border-top: 1px solid {p.border};
+    }}
+    QLabel#selectCount {{ font-size: 13px; font-weight: 700; color: {p.accent}; }}
+    QLabel#selectHint {{ font-size: 11.5px; color: {p.muted}; }}
+    QPushButton#dangerBtn {{
+        background-color: {p.danger};
+        border: none;
+        border-radius: 10px;
+        color: #FFFFFF;
+        font-size: 12.5px;
+        font-weight: 700;
+        padding: 6px 12px;
+    }}
+    QPushButton#dangerBtn:hover {{ background-color: {p.danger}; color: #FFFFFF; border: 1px solid #FFFFFF; }}
+    QPushButton#dangerBtn:disabled {{ background-color: {p.track}; color: {p.muted}; }}
+    /* 会话内置顶横幅：贴在聊天头部下面 */
+    QFrame#pinBanner {{
+        background-color: {p.card};
+        border: none;
+        border-bottom: 1px solid {p.border};
+    }}
+    QLabel#pinTitle {{ font-size: 11.5px; font-weight: 700; color: {p.accent}; }}
+    QLabel#pinText {{ font-size: 12px; color: {p.text}; }}
+    QLabel#pinCounter {{ font-size: 11px; color: {p.muted}; }}
+    QLabel#pinScope {{ font-size: 10.5px; color: {p.accent}; background-color: {p.accent_soft};
+        border-radius: 6px; padding: 1px 5px; }}
+    QToolButton#pinNav {{
+        border: none; border-radius: 6px; color: {p.muted}; font-size: 14px;
+        background: transparent; padding: 0px;
+    }}
+    QToolButton#pinNav:hover {{ background-color: {p.card}; color: {p.text}; }}
+    QFrame#pinBanner:hover {{ background-color: {p.card_alt}; }}
+    /* 输入栏上方的"回复 XX"条 */
+    QFrame#replyBar {{
+        background-color: {p.card};
+        border: none;
+        border-left: 3px solid {p.accent};
+        border-radius: 8px;
+    }}
+    QLabel#replyTitle {{ font-size: 11.5px; font-weight: 700; color: {p.accent}; }}
+    QLabel#replyText {{ font-size: 12px; color: {p.muted}; }}
+    /* 转发窗口 */
+    QDialog#forwardRoot {{ background-color: {p.surface}; }}
+    QLabel#forwardTitle {{ font-size: 18px; font-weight: 700; color: {p.text}; }}
+    QLabel#forwardSubtitle {{ font-size: 12px; color: {p.muted}; }}
+    QPushButton#convRow {{
+        background-color: {p.card};
+        border: 1px solid {p.border};
+        border-radius: 12px;
+        color: {p.text};
+        font-size: 13px;
+        font-weight: 600;
+        padding: 9px 12px;
+        text-align: left;
+    }}
+    QPushButton#convRow:hover {{ border-color: {p.accent}; color: {p.accent}; }}
+    QPushButton#convRow:pressed {{ background-color: {p.track}; }}
+    QLabel#forwardFoot {{ font-size: 11.5px; color: {p.muted}; }}
+
+    /* ---------------------------------------------------------- 设置 -- */
+    QDialog#settingsRoot {{ background-color: {p.surface}; }}
+    QLabel#settingsTitle {{ font-size: 19px; font-weight: 700; color: {p.text}; }}
+    QLabel#settingsSubtitle {{ font-size: 12px; color: {p.muted}; }}
+    QLabel#settingName {{ font-size: 13.5px; font-weight: 600; color: {p.text}; }}
+    QLabel#settingHint {{ font-size: 11.5px; color: {p.muted}; }}
+    QLabel#settingValue {{ font-size: 12px; font-weight: 600; color: {p.accent}; }}
+    /* 字号预览：改档位时这里的字号会动画过渡（所见即所得） */
+    QLabel#settingsPreview {{
+        background-color: {p.card_alt};
+        border: 1px solid {p.border};
+        border-radius: 10px;
+        color: {p.text};
+        padding: 10px 12px;
+    }}
+    QLabel#settingsFoot {{ font-size: 11px; color: {p.muted}; }}
+    /* 设置里的次要按钮（"打开数据目录"） */
+    QPushButton#ghostBtn {{
+        background-color: {p.card_alt};
+        border: 1px solid {p.border};
+        border-radius: 10px;
+        color: {p.text};
+        font-size: 12.5px;
+        font-weight: 600;
+        padding: 6px 12px;
+    }}
+    QPushButton#ghostBtn:hover {{ border-color: {p.accent}; color: {p.accent}; }}
+    QPushButton#ghostBtn:pressed {{ background-color: {p.track}; }}
     """
+    return scale_font_sizes(qss, font_scale() if scale is None else scale)

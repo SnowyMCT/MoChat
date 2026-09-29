@@ -22,14 +22,14 @@ from __future__ import annotations
 
 import math
 
-from PyQt6.QtCore import (QEasingCurve, QPropertyAnimation, QTimer, Qt,
+from PyQt6.QtCore import (QEasingCurve, QPoint, QPropertyAnimation, QTimer, Qt,
                           pyqtProperty)
 from PyQt6.QtGui import QColor, QPainter, QPixmap
 from PyQt6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
 __all__ = ["FAST_MS", "NORMAL_MS", "SLOW_MS", "UNLIMITED", "set_enabled", "is_enabled",
-           "fade_in", "stagger_fade_in", "cross_fade", "cancel",
-           "TypingDots", "SnapshotOverlay"]
+           "fade_in", "fade_out", "slide_in", "stagger_fade_in", "cross_fade", "cancel",
+           "is_animating", "TypingDots", "SnapshotOverlay"]
 
 FAST_MS = 140          # 小东西（胶囊、结果行）
 NORMAL_MS = 200        # 常规（气泡入场）
@@ -115,8 +115,19 @@ def cancel(widget: QWidget) -> None:
         pass
 
 
-def fade_in(widget: QWidget, *, ms: int = NORMAL_MS, on_done=None):
-    """淡入到完全不透明，结束后**摘掉效果**（稳态不留离屏合成）。"""
+def is_animating(widget: QWidget) -> bool:
+    """这个控件身上的淡入/淡出还在跑吗（测试别去断言中间帧，用这个查状态）。"""
+    cached = getattr(widget, _FADE_ATTR, None)
+    if cached is None:
+        return False
+    try:
+        return cached[1].state() == QPropertyAnimation.State.Running
+    except RuntimeError:                        # pragma: no cover - 控件已销毁
+        return False
+
+
+def _fade(widget: QWidget, *, start: float, end: float, ms: int, on_done=None):
+    """淡入/淡出的共同实现（复用同一个动画对象，别每次新建）。"""
     if not _enabled:
         _detach_effect(widget)
         if on_done is not None:
@@ -137,12 +148,52 @@ def fade_in(widget: QWidget, *, ms: int = NORMAL_MS, on_done=None):
     except TypeError:
         pass
     animation.setDuration(ms)
-    animation.setStartValue(0.0)
-    animation.setEndValue(1.0)
+    animation.setStartValue(float(start))
+    animation.setEndValue(float(end))
     animation.finished.connect(lambda: (_defer_detach(widget),
                                         on_done() if on_done is not None else None))
     animation.start()
     return animation
+
+
+def fade_in(widget: QWidget, *, ms: int = NORMAL_MS, on_done=None):
+    """淡入到完全不透明，结束后**摘掉效果**（稳态不留离屏合成）。"""
+    return _fade(widget, start=0.0, end=1.0, ms=ms, on_done=on_done)
+
+
+def fade_out(widget: QWidget, *, ms: int = FAST_MS, on_done=None):
+    """淡出到透明（关设置面板这类"收场"动效）。
+
+    从**当前透明度**接着淡（连点两次不会先跳回 1 再淡），结束后同样摘掉效果 ——
+    留在控件上的透明效果等于常驻一层离屏合成。
+    """
+    effect = widget.graphicsEffect()
+    start = 1.0
+    if isinstance(effect, QGraphicsOpacityEffect):
+        try:
+            start = max(0.0, min(1.0, effect.opacity()))
+        except RuntimeError:                            # pragma: no cover
+            start = 1.0
+    return _fade(widget, start=start, end=0.0, ms=ms, on_done=on_done)
+
+
+def slide_in(widget: QWidget, *, offset: int = 18, ms: int = SLOW_MS, on_done=None):
+    """从下方 ``offset`` 像素处淡入滑上来（设置面板的入场）。
+
+    只动**窗口自己**的 ``pos``：顶层窗口的几何由窗口系统 / 我们的代码决定，
+    布局管不着它 —— 所以在布局里动 pos 会被立刻改回去那个坑在这里不存在。
+    """
+    animation = fade_in(widget, ms=ms, on_done=on_done)
+    if not _enabled:
+        return animation
+    end = widget.pos()
+    move = QPropertyAnimation(widget, b"pos", widget)
+    move.setDuration(ms)
+    move.setEasingCurve(EASING)
+    move.setStartValue(QPoint(end.x(), end.y() + max(0, int(offset))))
+    move.setEndValue(end)
+    move.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+    return move
 
 
 def slide_scroll(scrollbar, offset: int, *, ms: int = NORMAL_MS + 40):

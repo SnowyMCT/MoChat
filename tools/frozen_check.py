@@ -1,19 +1,21 @@
-"""打包自检：在**冻结后的 exe 里**验证旗帜素材都在、并且真的画成了图。
+"""打包自检：在**冻结后的 exe 里**验证素材都在、并且真的画成了图。
 
 为什么要这么个东西
 ------------------
-旗帜是**图片素材**，只能靠打包时带进去（见 main.spec 的 datas）。打包方式一变
-（例如回头顺手用 `pyinstaller -F -w main.py`）素材就悄悄丢了 —— 表现是界面里
-旗帜全变成 "CN" "JP"，而**程序本身照样启动得好好的**，所以"能打开"不算验证。
-这个探针把三件事依次钉死，每步都打印证据：
+旗帜和演示附件都是**图片/文件素材**，只能靠打包时带进去（见 main.spec 的 datas）。
+打包方式一变（例如回头顺手用 `pyinstaller -F -w main.py`）素材就悄悄丢了 ——
+表现是界面里旗帜全变成 "CN" "JP"、演示数据里的图片消息变成"图片不在本地"，
+而**程序本身照样启动得好好的**，所以"能打开"不算验证。
+这个探针把四件事依次钉死，每步都打印证据：
 
-    素材找到了吗（路径 + 数量）→ 图标切出来了吗（相邻两面旗的像素得不一样）
+    素材找到了吗（路径 + 数量）→ 演示附件能解码吗（图片真的能画出彩色像素）
+    → 图标切出来了吗（相邻两面旗的像素得不一样）
     → 画到界面上了吗（旗帜在富文本里要真的是 <img>，并留一张截图给人看）
 
 用法：先在**与主程序同一套 datas** 下打成一次性 exe，跑它、看退出码：
 
-    pyinstaller tools/frozen_check.py --onefile --console --noconfirm \
-        --paths . --add-data "mchat/assets;mchat/assets" --name frozen_check \
+    pyinstaller tools/frozen_check.py --onefile --console --noconfirm \\
+        --paths . --add-data "mchat/assets;mchat/assets" --name frozen_check \\
         --specpath build --workpath build/probe --distpath dist
     dist/frozen_check.exe                     # 退出码 0 = 素材链路完好
     dist/frozen_check.exe --shot out.png      # 顺手存一张截图
@@ -48,6 +50,8 @@ from PyQt6.QtCore import QSize, Qt                                          # no
 from PyQt6.QtGui import QImage                                               # noqa: E402
 from PyQt6.QtWidgets import QApplication, QLabel                             # noqa: E402
 
+from mchat.core import assets as demo_assets                                 # noqa: E402
+from mchat.ui import attach as attach_view                                   # noqa: E402
 from mchat.ui import emoji as emoji_data                                     # noqa: E402
 from mchat.ui import flag_text                                               # noqa: E402
 from mchat.ui import flags as flag_data                                      # noqa: E402
@@ -88,7 +92,9 @@ def main(argv: list[str] | None = None) -> int:
           f"_MEIPASS={getattr(sys, '_MEIPASS', '(无)')}")
     print(f"  flags.py={flag_data.__file__}")
 
-    print("[1/4] 素材路径")
+    app = QApplication.instance() or QApplication([])     # 后面画图/解码都要它
+
+    print("[1/5] 素材路径")
     assets = os.path.dirname(flag_data.sprite_path())
     check("素材目录不是空的", os.path.isdir(assets), assets)
     check("精灵图 flags.png 在", flag_data.sprite_exists(), flag_data.sprite_path())
@@ -97,7 +103,18 @@ def main(argv: list[str] | None = None) -> int:
           f"{len(pngs)}/{len(flag_data.FLAG_CHARS)}")
     check("flag_text 认为素材可用", flag_text.assets_available())
 
-    print("[2/4] 富文本里的旗帜是 <img>（消息气泡/输入框走这条路）")
+    print("[2/5] 演示附件素材（图片消息 / 文件消息）")
+    for name in (demo_assets.DEMO_PHOTO, demo_assets.DEMO_REPORT):
+        path = demo_assets.demo_path(name)
+        check(f"{name} 在包里", os.path.isfile(path) and os.path.getsize(path) > 0, path)
+    preview = attach_view.scaled_preview(demo_assets.demo_path(demo_assets.DEMO_PHOTO))
+    check("演示图片能解码并缩放（不是坏图/空图）",
+          preview is not None and preview.width() > 0
+          and colorful_pixels(preview.toImage()) > 100,
+          f"{preview.width()}x{preview.height()}"
+          f"，彩色像素 {colorful_pixels(preview.toImage())}" if preview else "解不出来")
+
+    print("[3/5] 富文本里的旗帜是 <img>（消息气泡/输入框走这条路）")
     for char in SAMPLES[:3]:
         html, rich = flag_text.to_display(f"国旗 {char} 到")
         tag = flag_text.to_html(char, size=18)
@@ -107,8 +124,7 @@ def main(argv: list[str] | None = None) -> int:
               rich and f"<img" in html and os.path.isfile(path),
               path or "(没有 src)")
 
-    print("[3/4] 界面：面板里的旗帜图标 + 气泡里的渲染")
-    app = QApplication.instance() or QApplication([])
+    print("[4/5] 界面：面板里的旗帜图标 + 气泡里的渲染")
     picker = EmojiPicker()
     picker.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)   # 不出现在屏幕上
     picker.show()
@@ -150,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         shot.save(args.shot)
         print(f"  截图：{args.shot}")
 
-    print("[4/4] 收尾")
+    print("[5/5] 收尾")
     label.close()
     picker.close()
     picker.deleteLater()

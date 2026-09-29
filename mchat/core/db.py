@@ -21,22 +21,36 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Iterable
 
-from .models import Message
+from .models import (Attachment, Message, PinRef, merged_from_json,   # noqa: F401
+                     merged_to_json, pins_from_json, pins_to_json,
+                     reply_from_json, reply_to_json)
 
 __all__ = ["ChatLog", "SearchHit", "DEFAULT_LIMIT", "SEARCH_LIMIT", "TRIGRAM_MIN"]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 DEFAULT_LIMIT = 200        # 单个会话一次取多少条（界面只画这么多）
 SEARCH_LIMIT = 60          # 搜索一次最多返回多少条
 TRIGRAM_MIN = 3            # trigram 索引能命中的最短关键词长度
 
-SCHEMA = """
+# 表。注意 messages 的三列是 v2 新增的（老库由 _migrate 补上）：
+# * attachment  —— 附件（JSON：path/name/size），没有就是 NULL
+# * file_name   —— 附件文件名（单独一列，给下面的生成列用）
+# * search_text —— **被 FTS 索引的那一列**：正文 + 附件文件名，且是 VIRTUAL 生成列。
+#   为什么要这么绕：这样"搜文件名"也能命中（用户丢进来一个「评审材料-v3.pdf」，
+#   搜「评审材料」就找得到），而 text 仍然是干净的正文（读回来原样显示）；
+#   同时因为是 VIRTUAL 生成列，**磁盘上不会把正文存两遍**（2 万条实测体积不变），
+#   也不存在"手写代码维持索引串"那种漂移风险 —— SQLite 自己算。
+SEARCH_TEXT_EXPR = ("CASE WHEN file_name = '' THEN text"
+                    " ELSE trim(text || ' ' || file_name) END")
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS messages(
     id              TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL,
@@ -44,26 +58,15 @@ CREATE TABLE IF NOT EXISTS messages(
     text            TEXT NOT NULL,
     ts              REAL NOT NULL,
     outgoing        INTEGER NOT NULL DEFAULT 0,
-    status          TEXT NOT NULL DEFAULT 'sent'
+    status          TEXT NOT NULL DEFAULT 'sent',
+    attachment      TEXT,
+    file_name       TEXT NOT NULL DEFAULT '',
+    reply_to        TEXT,                              -- v3：被回复那条的快照（JSON）
+    forwarded_from  TEXT NOT NULL DEFAULT '',          -- v3：转发自哪个会话
+    merged          TEXT NOT NULL DEFAULT '',          -- v3：合并转发的内容（JSON 数组）
+    search_text     TEXT GENERATED ALWAYS AS ({SEARCH_TEXT_EXPR}) VIRTUAL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, ts);
-
--- trigram：按 3 字符滑窗建索引，中文/英文都能做"子串"检索
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    text, content='messages', content_rowid='rowid', tokenize='trigram'
-);
-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, text)
-    VALUES ('delete', old.rowid, old.text);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, text)
-    VALUES ('delete', old.rowid, old.text);
-    INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
-END;
 
 CREATE TABLE IF NOT EXISTS reactions(
     message_id TEXT NOT NULL,
@@ -81,20 +84,49 @@ CREATE TABLE IF NOT EXISTS drafts(
 
 -- 会话级旗标：侧栏右键菜单里的置顶/免打扰，以及"清空过历史"的标记。
 -- cleared 是给启动时看的：演示数据每次都重新生成，没这个标记的话清空过的会话
--- 下次启动又会满血复活。
+-- 下次启动又会满血复活。pinned_message_id 是 v3 加的：会话内被置顶的那条消息。
 CREATE TABLE IF NOT EXISTS chats(
     conversation_id TEXT PRIMARY KEY,
     pinned          INTEGER NOT NULL DEFAULT 0,
     muted           INTEGER NOT NULL DEFAULT 0,
-    cleared         INTEGER NOT NULL DEFAULT 0
+    cleared         INTEGER NOT NULL DEFAULT 0,
+    pinned_message_id TEXT NOT NULL DEFAULT ''
 );
 """
 
+# 全文索引 + 触发器。触发器每次都重建（DROP + CREATE）：这样改索引列名/索引内容时，
+# 老库不需要额外判断，重新打开就自动跟上。
+SCHEMA_FTS = """
+-- trigram：按 3 字符滑窗建索引，中文/英文都能做"子串"检索
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    search_text, content='messages', content_rowid='rowid', tokenize='trigram'
+);
+DROP TRIGGER IF EXISTS messages_ai;
+DROP TRIGGER IF EXISTS messages_ad;
+DROP TRIGGER IF EXISTS messages_au;
+CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, search_text) VALUES (new.rowid, new.search_text);
+END;
+CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, search_text)
+    VALUES ('delete', old.rowid, old.search_text);
+END;
+CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, search_text)
+    VALUES ('delete', old.rowid, old.search_text);
+    INSERT INTO messages_fts(rowid, search_text) VALUES (new.rowid, new.search_text);
+END;
+"""
+
 _UPSERT = """
-INSERT INTO messages(id, conversation_id, sender_id, text, ts, outgoing, status)
-VALUES(?, ?, ?, ?, ?, ?, ?)
+INSERT INTO messages(id, conversation_id, sender_id, text, ts, outgoing, status,
+                     attachment, file_name, reply_to, forwarded_from, merged)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
-    text = excluded.text, ts = excluded.ts, status = excluded.status
+    text = excluded.text, ts = excluded.ts, status = excluded.status,
+    attachment = excluded.attachment, file_name = excluded.file_name,
+    reply_to = excluded.reply_to, forwarded_from = excluded.forwarded_from,
+    merged = excluded.merged
 """
 
 
@@ -124,9 +156,64 @@ class ChatLog:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(SCHEMA)
-        if self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+        migrated = self._migrate()                        # 老库（v1）补列 + 打标记
+        self._db.executescript(SCHEMA_FTS)
+        if migrated:
+            # 索引列变了（text -> search_text），整份重建一次；老库只有 v1 那一次
+            self._db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+            self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        elif self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._db.commit()
+
+    def _migrate(self) -> bool:
+        """把老库升到当前版本，返回**消息表是否被动过**（动了就要重建 FTS 索引）。
+
+        ``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表加列，所以老库必须显式 ALTER。
+        各版本加了什么：
+
+        * v1 -> v2：``attachment`` / ``file_name`` / ``search_text``（VIRTUAL 生成列）。
+          ``search_text`` 由 SQLite 按现有行现算，不需要回填数据，v1 里也没有附件，
+          所以老消息的索引内容就等于正文，语义完全不变。
+        * v2 -> v3：``reply_to``（回复的引用快照）/ ``forwarded_from``（转发自哪）/
+          ``merged``（合并转发的内容）；会话表加 ``pinned_message_id``（会话内置顶）。
+          这几列都是 NULL/空串默认值，老库里的消息语义不受影响，FTS 索引也不用重建。
+
+        用 ``table_xinfo`` 而不是 ``table_info``：后者**不列生成列**，拿它判断"列在不在"
+        会把已有的 search_text 当成缺列，再来一次 ALTER 直接报 duplicate column。
+        """
+        columns = {row["name"] for row in self._db.execute("PRAGMA table_xinfo(messages)")}
+        changed = False
+        # ---- v1 -> v2 ----
+        if "attachment" not in columns:
+            self._db.execute("ALTER TABLE messages ADD COLUMN attachment TEXT")
+            changed = True
+        if "file_name" not in columns:
+            self._db.execute("ALTER TABLE messages ADD COLUMN file_name TEXT "
+                             "NOT NULL DEFAULT ''")
+            changed = True
+        if "search_text" not in columns:
+            self._db.execute(
+                f"ALTER TABLE messages ADD COLUMN search_text TEXT GENERATED ALWAYS AS "
+                f"({SEARCH_TEXT_EXPR}) VIRTUAL")
+            changed = True
+        # ---- v2 -> v3 ----
+        if "reply_to" not in columns:
+            self._db.execute("ALTER TABLE messages ADD COLUMN reply_to TEXT")
+        if "forwarded_from" not in columns:
+            self._db.execute("ALTER TABLE messages ADD COLUMN forwarded_from TEXT "
+                             "NOT NULL DEFAULT ''")
+        if "merged" not in columns:
+            self._db.execute("ALTER TABLE messages ADD COLUMN merged TEXT NOT NULL DEFAULT ''")
+        chat_columns = {row["name"] for row in self._db.execute("PRAGMA table_xinfo(chats)")}
+        if "pinned_message_id" not in chat_columns:
+            self._db.execute("ALTER TABLE chats ADD COLUMN pinned_message_id TEXT "
+                             "NOT NULL DEFAULT ''")
+        if changed:
+            # v1 的 FTS 表索引的是 text 这一列，列名对不上新的触发器，只能整表重建
+            self._db.execute("DROP TABLE IF EXISTS messages_fts")
+            self._db.commit()
+        return changed
 
     def close(self) -> None:
         self._db.close()
@@ -192,6 +279,34 @@ class ChatLog:
         return {row[0]: {name for index, name in enumerate(self.FLAGS, start=1) if row[index]}
                 for row in rows}
 
+    # ------------------------------------------------------------------ 会话内置顶
+    def pinned_refs(self) -> dict[str, tuple[PinRef, ...]]:
+        """``{会话id: (PinRef, ...)}`` —— 一个会话可以置顶多条，每条带"给不给对方看"。
+
+        这一列先后用过三种存法，读的时候全认（见 ``models.pins_from_json``）：
+        单个 id 字符串（v3 第一版）→ 纯 id 数组（"多条置顶"那版）→
+        现在 ``[{"id":..,"both":..}, ...]``。所以不用加列、也不用升版本。
+        """
+        rows = self._db.execute(
+            "SELECT conversation_id, pinned_message_id FROM chats "
+            "WHERE pinned_message_id != ''").fetchall()
+        pinned: dict[str, tuple[PinRef, ...]] = {}
+        for row in rows:
+            refs = pins_from_json(row["pinned_message_id"])
+            if refs:
+                pinned[row["conversation_id"]] = refs
+        return pinned
+
+    def set_pinned_refs(self, conversation_id: str, pins) -> None:
+        """把"这个会话置顶了哪几条、各是什么可见范围"整串写进库（空 = 清掉置顶）。"""
+        payload = pins_to_json(pins)
+        with self._db:
+            self._db.execute(
+                "INSERT INTO chats(conversation_id, pinned_message_id) VALUES (?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                "pinned_message_id = excluded.pinned_message_id",
+                (conversation_id, payload))
+
     def clear_conversation(self, conversation_id: str) -> int:
         """清掉**这一个**会话的历史（消息 + 回应 + 草稿），返回删掉几条消息。
 
@@ -207,6 +322,9 @@ class ChatLog:
             self._db.execute(
                 "INSERT INTO chats(conversation_id, cleared) VALUES (?, 1) "
                 "ON CONFLICT(conversation_id) DO UPDATE SET cleared = 1", (conversation_id,))
+            # 置顶的那条也被删了，顺手把置顶清掉 —— 否则下次进来会指一条不存在的消息
+            self._db.execute("UPDATE chats SET pinned_message_id = '' "
+                             "WHERE conversation_id = ?", (conversation_id,))
         self.compact()               # 腾出来的页还给系统（几十毫秒），文件真的变小
         return cursor.rowcount
 
@@ -243,6 +361,8 @@ class ChatLog:
 
         ``snippet`` 由 SQLite 直接给出（``snippet()`` / ``substr(instr())``），
         Python 侧不用再切字符串。
+
+        检索的是 ``search_text``（正文 + 附件文件名），所以"搜附件名"也能找到消息。
         """
         query = (query or "").strip()
         if not query:
@@ -267,14 +387,16 @@ class ChatLog:
             params.append(int(limit))
             rows = self._db.execute(
                 "SELECT conversation_id, id, ts, outgoing,"
-                " substr(text, max(1, instr(lower(text), lower(?)) - 12), 60) AS snip"
-                f" FROM messages WHERE text LIKE ?{scope} ORDER BY ts DESC LIMIT ?",
+                " substr(search_text, max(1, instr(lower(search_text), lower(?)) - 12),"
+                " 60) AS snip"
+                f" FROM messages WHERE search_text LIKE ?{scope}"
+                " ORDER BY ts DESC LIMIT ?",
                 params).fetchall()
         return [SearchHit(row["conversation_id"], row["id"], row["snip"],
                           row["ts"], bool(row["outgoing"])) for row in rows]
 
     def stats(self) -> dict:
-        """给菜单/自检用：条数、会话数、互动数、文件占用。"""
+        """给菜单/自检用：条数、会话数、互动数、附件数、文件占用。"""
         size = 0
         for suffix in ("", "-wal", "-shm"):
             try:
@@ -286,6 +408,8 @@ class ChatLog:
             "conversations": len(self.conversations()),
             "reactions": self._db.execute("SELECT count(*) FROM reactions").fetchone()[0],
             "drafts": self._db.execute("SELECT count(*) FROM drafts").fetchone()[0],
+            "attachments": self._db.execute(
+                "SELECT count(*) FROM messages WHERE attachment IS NOT NULL").fetchone()[0],
             "bytes": size,
         }
 
@@ -374,11 +498,30 @@ class ChatLog:
 
     @staticmethod
     def _row(message: Message) -> tuple:
+        attachment = message.attachment
         return (message.id, message.conversation_id, message.sender_id, message.text,
-                float(message.ts), int(bool(message.outgoing)), message.status)
+                float(message.ts), int(bool(message.outgoing)), message.status,
+                attachment.dump() if attachment is not None else None,
+                attachment.name if attachment is not None else "",
+                reply_to_json(message.reply_to), message.forwarded_from,
+                merged_to_json(message.merged_items))
 
     @staticmethod
     def _message(row: sqlite3.Row) -> Message:
         return Message(id=row["id"], conversation_id=row["conversation_id"],
                        sender_id=row["sender_id"], text=row["text"], ts=row["ts"],
-                       outgoing=bool(row["outgoing"]), status=row["status"])
+                       outgoing=bool(row["outgoing"]), status=row["status"],
+                       attachment=_attachment(row["attachment"]),
+                       reply_to=reply_from_json(row["reply_to"]),
+                       forwarded_from=row["forwarded_from"],
+                       merged_items=merged_from_json(row["merged"]))
+
+
+def _attachment(raw) -> Attachment | None:
+    """把库里那一列 JSON 还原成附件；空值/坏数据都当"没有附件"（别炸界面）。"""
+    if not raw:
+        return None
+    try:
+        return Attachment.from_json(json.loads(raw))
+    except (TypeError, ValueError):
+        return None

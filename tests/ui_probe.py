@@ -5,6 +5,7 @@
     widget_pixel(win, widget, x, y)  取控件内某点在截图里的颜色（含 DPR 处理）
     drag_split_handle(handle, dx)    在分界线上做一次真实左键拖动
     double_click_handle(handle)      在分界线上做一次真实双击
+    sweep_select(listw, start, end)  在消息区做一次真实左键划选（拖动多选）
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from PyQt6.QtWidgets import QApplication
 
 __all__ = ["pump", "wait_for", "glyph_pixels", "widget_pixel", "drag_split_handle",
            "double_click_handle", "press_handle", "release_handle",
-           "colorful_pixels"]
+           "colorful_pixels", "sweep_select"]
 
 
 def pump(app, ms: int = 260) -> None:
@@ -114,10 +115,11 @@ def widget_pixel(window, widget, local_x: int, local_y: int):
     return image.pixelColor(x, y)
 
 
-def _send_mouse(widget, kind, local: QPoint, window_global: QPoint, button, buttons):
+def _send_mouse(widget, kind, local: QPoint, window_global: QPoint, button, buttons,
+                modifiers=Qt.KeyboardModifier.NoModifier):
     """发一个带真实全局坐标的鼠标事件（走 Qt 的事件分发链路，不是直接调方法）。"""
     event = QMouseEvent(kind, QPointF(local), QPointF(window_global), button, buttons,
-                        Qt.KeyboardModifier.NoModifier)
+                        modifiers)
     QApplication.sendEvent(widget, event)
 
 
@@ -161,6 +163,34 @@ def drag_split_handle(handle, dx: int, *, steps: int = 4) -> None:
                 handle.mapToGlobal(local) + QPoint(dx, 0),
                 Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton)
     release_handle(handle)
+
+
+def sweep_select(list_widget, start: QPoint, end: QPoint, *, steps: int = 5,
+                 modifiers=Qt.KeyboardModifier.NoModifier) -> None:
+    """在消息区里做一次真实左键划选：按下 → 分步移动 → 松开（拖动多选）。
+
+    * 按下的那一下要送到"平台会送到的那个控件"：``viewport().childAt(点)`` 命中的就是它
+      （命中不到就送视口本体）—— 消息列表那个顶层过滤器就是靠"按下落在谁身上"来认锚点的。
+    * 移动跟着送到按下的那个控件（真实世界里按住以后事件都归它），全局坐标一步一步给真值，
+      因为过滤器只认全局坐标算"划了多远 / 划过了哪块矩形"。
+    * **松开送到终点下面真正命中的那个控件**：气泡上的接收层只认"按下 + 原地松手"，
+      划选结束时松手落在它身上不该再翻一次勾 —— 这条只有真按这个路径送才测得出来。
+    """
+    viewport = list_widget.viewport()
+    target = viewport.childAt(start) or viewport
+    _send_mouse(target, QEvent.Type.MouseButtonPress, target.mapFrom(viewport, start),
+                viewport.mapToGlobal(start), Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton, modifiers)
+    for index in range(1, max(1, steps) + 1):
+        point = QPoint(start.x() + (end.x() - start.x()) * index // max(1, steps),
+                       start.y() + (end.y() - start.y()) * index // max(1, steps))
+        _send_mouse(target, QEvent.Type.MouseMove, target.mapFrom(viewport, point),
+                    viewport.mapToGlobal(point), Qt.MouseButton.NoButton,
+                    Qt.MouseButton.LeftButton, modifiers)
+    landing = viewport.childAt(end) or viewport
+    _send_mouse(landing, QEvent.Type.MouseButtonRelease, landing.mapFrom(viewport, end),
+                viewport.mapToGlobal(end), Qt.MouseButton.LeftButton,
+                Qt.MouseButton.NoButton, modifiers)
 
 
 def double_click_handle(handle) -> None:

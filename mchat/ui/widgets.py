@@ -18,17 +18,20 @@ from __future__ import annotations
 
 from PyQt6.QtCore import (QEasingCurve, QEvent, QPoint, QPropertyAnimation, QRect,
                           QSize, QTimer, Qt, pyqtProperty, pyqtSignal)
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPalette
+from PyQt6.QtGui import QColor, QPen, QFont, QFontMetrics, QPainter, QPalette
 from PyQt6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
                              QLineEdit, QPlainTextEdit, QSizePolicy, QToolButton,
                              QVBoxLayout, QWidget)
 
-__all__ = ["lerp", "mix_color", "FloatingLabelInput", "SegmentedControl", "Toast",
-           "CollapsibleSection", "SplitHandle", "confirm_destructive"]
+from . import anim
+from . import theme
+
+__all__ = ["lerp", "mix_color", "FloatingLabelInput", "SegmentedControl", "ToggleSwitch",
+           "Toast", "CollapsibleSection", "SplitHandle", "confirm_destructive"]
 
 
 def confirm_destructive(parent, palette, *, title: str, text: str,
-                        ok_text: str = "确定删除") -> bool:
+                        ok_text: str = "确定删除", detail: str = "") -> bool:
     """危险操作的二次确认：弹窗 + 红色按钮（删消息、清空历史这类不可撤销的动作）。
 
     用 `QMessageBox` 而不是自绘对话框：它有平台标准的按键/回车/Esc 行为，
@@ -40,6 +43,9 @@ def confirm_destructive(parent, palette, *, title: str, text: str,
     box.setIcon(QMessageBox.Icon.Warning)
     box.setWindowTitle(title)
     box.setText(text)
+    if detail:
+        # 批量操作时把"要删的到底是哪几条"摆出来（Qt 的"显示详情"折叠区）
+        box.setDetailedText(detail)
     confirm = box.addButton(ok_text, QMessageBox.ButtonRole.AcceptRole)
     box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
     box.setDefaultButton(box.buttons()[-1])                # 默认停在"取消"上，别手滑
@@ -163,7 +169,8 @@ class FloatingLabelInput(QWidget):
         # ---- 动画 ----
         self._anim = QPropertyAnimation(self, b"labelProgress", self)
         self._anim.setDuration(self.ANIM_MS)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # InOutCubic：起步慢、中间快、收尾慢 —— 两头都不"撞墙"
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
 
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -206,9 +213,23 @@ class FloatingLabelInput(QWidget):
 
     def _recompute_float_width(self) -> None:
         font = QFont(self.font())
-        font.setPointSizeF(self.FLOAT_PT)
+        font.setPointSizeF(self.FLOAT_PT * self.font_scale())
         font.setWeight(QFont.Weight.DemiBold)
         self._float_w = QFontMetrics(font).horizontalAdvance(self._label_text) + self.LABEL_PAD * 2 + 4
+
+    def font_scale(self) -> float:
+        """当前"文字大小"系数。
+
+        界面上的字号大多写在 QSS 里、由 ``theme.scale_font_sizes()`` 统一缩放，只有
+        这个悬浮标签的磅值是写死在代码里的两档（14 → 11.5），所以它得自己跟着走 ——
+        否则"文字大小"调大以后，标签会显得比框里的字小一号。
+        """
+        return theme.font_scale()
+
+    def refresh_fonts(self) -> None:
+        """字号设置变了：重算标签宽度（浮起后的缺口宽度是按字号量出来的）并重排。"""
+        self._recompute_float_width()
+        self._apply_progress()
 
     def _apply_progress(self) -> None:
         """按当前进度摆放标签：位置 + 字号 + 字重 + 颜色，全部插值。"""
@@ -222,7 +243,7 @@ class FloatingLabelInput(QWidget):
         self._label.setGeometry(x, y, w, self.LABEL_H)
 
         font = QFont(self._label.font())
-        font.setPointSizeF(lerp(self.INSIDE_PT, self.FLOAT_PT, t))
+        font.setPointSizeF(lerp(self.INSIDE_PT, self.FLOAT_PT, t) * self.font_scale())
         font.setWeight(_WEIGHTS[min(2, int(t * 3))])
         self._label.setFont(font)
 
@@ -347,7 +368,7 @@ class FloatingLabelInput(QWidget):
             # 眼睛按钮用全局 QSS 上色，主题变了要让样式重新解析一次
             self._eye.style().unpolish(self._eye)
             self._eye.style().polish(self._eye)
-        self._apply_progress()
+        self.refresh_fonts()   # 字号设置也可能刚变过（两个设置都是在这里统一生效）
 
     def _apply_field_style(self) -> None:
         p = self._palette
@@ -532,6 +553,164 @@ class SegmentedControl(QWidget):
 # ---------------------------------------------------------------------------
 # 提示气泡
 # ---------------------------------------------------------------------------
+class ToggleSwitch(QWidget):
+    """iOS 风格的开关：旋钮滑过去 + 轨道颜色渐变，两件事都走动画。
+
+    为什么自绘、不用 QSS 的 ``:checked`` 静态样式：用户点下去的那一下要有"跟手"的过渡，
+    静态换色会显得很硬；而且自绘才能让颜色跟着主题走（QSS 的勾选态没法插值）。
+    关掉全局动效时直接落终态 —— 界面语义不变，只是没有过渡。
+    """
+
+    toggled = pyqtSignal(bool)
+
+    TRACK_W = 46
+    TRACK_H = 25
+    KNOB_PAD = 3
+    ANIM_MS = 260          # 原来 180ms + OutCubic，切换"啪"一下就完了，看着生硬
+    STRETCH = 5.0          # 滑动途中旋钮最多拉长几像素（iOS 的手感就在这儿）
+
+    def __init__(self, checked: bool = False, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("toggleSwitch")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)      # 点完别把焦点从输入框抢走
+        self.setFixedSize(self.TRACK_W, self.TRACK_H)
+        self._checked = bool(checked)
+        self._progress = 1.0 if self._checked else 0.0
+        self._palette = None
+        self._anim = QPropertyAnimation(self, b"progressValue", self)
+        self._anim.setDuration(self.ANIM_MS)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.setToolTip("开" if self._checked else "关")
+
+    # ------------------------------------------------------------------ 状态
+    def is_checked(self) -> bool:
+        return self._checked
+
+    def set_checked(self, checked: bool, *, animate: bool = True,
+                    notify: bool = False) -> None:
+        """设状态；``notify=False`` 用于"别处改了、这边跟着同步"（避免信号回环）。"""
+        value = bool(checked)
+        changed = value != self._checked
+        self._checked = value
+        self.setToolTip("开" if value else "关")
+        if not animate or not anim.is_enabled():
+            self._anim.stop()
+            self._progress = 1.0 if value else 0.0
+            self.update()
+        else:
+            self._anim.stop()
+            self._anim.setStartValue(self._progress)
+            self._anim.setEndValue(1.0 if value else 0.0)
+            self._anim.start()
+        if changed and notify:
+            self.toggled.emit(value)
+
+    def toggle(self) -> None:
+        """用户点了一下：翻转状态并**发信号**（同步用的 set_checked 默认不发）。"""
+        self.set_checked(not self._checked, notify=True)
+
+    def progress(self) -> float:
+        """0 = 关，1 = 开（动画期间是中间值，测试看它有没有真的在动）。"""
+        return self._progress
+
+    def set_progress_value(self, value: float) -> None:
+        self._progress = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    progressValue = pyqtProperty(float, fget=progress, fset=set_progress_value)
+
+    def is_animating(self) -> bool:
+        return self._anim.state() == QPropertyAnimation.State.Running
+
+    def phase(self) -> float:
+        """这一趟动画走到哪儿了（0→1；没在动就是 0）。"""
+        if not self.is_animating():
+            return 0.0
+        duration = max(1, self._anim.duration())
+        return max(0.0, min(1.0, self._anim.currentTime() / duration))
+
+    def knob_stretch(self) -> float:
+        """旋钮当前该拉长多少像素：正弦包络，中段最大、两头归零。
+
+        这样画出来是"起步鼓一下、落定前收回去"，而不是从头到尾一个胖椭圆。
+        """
+        import math
+
+        return self.STRETCH * math.sin(math.pi * self.phase())
+
+    def apply_palette(self, palette) -> None:
+        self._palette = palette
+        self.update()
+
+    # ------------------------------------------------------------------ 绘制
+    def track_color(self) -> QColor:
+        """轨道当前颜色（关=底槽色，开=主题色，动画期间是插值）。
+
+        关态不能直接用 ``palette.track``：它在亮色下和窗口底色几乎一样
+        （实测 track=#e8edf3、surface=#E9EEF4，只差 1 个亮度），开关就剩一个白圆浮在那儿。
+        所以往 ``muted``（文字灰）靠 22% 再描一圈边（见 :meth:`paintEvent`），
+        两种主题下都立得住。
+        """
+        p = self._palette
+        base = QColor(p.track if p else "#EEF2F7")
+        if p is not None:
+            base = mix_color(base, QColor(p.muted), 0.22)
+        on = QColor(p.accent if p else "#3390EC")
+        return mix_color(base, on, self._progress)
+
+    def track_border(self) -> QColor:
+        """关态时轨道的那圈描边颜色（开态不描，颜色本身就够醒目）。"""
+        p = self._palette
+        if p is None:
+            return QColor("#D7DEE7")
+        return QColor(p.border)
+
+    def knob_color(self) -> QColor:
+        """旋钮恒为白色（和 iPhone 一样）。
+
+        第一版是"关态用卡片色"，结果暗色主题下旋钮（#1E2A38）和轨道（#202B36）几乎同一个
+        颜色，开关看起来就是一块实心胶囊 —— 截图里一眼就看出来了。白色 + 关态加一圈描边，
+        两种主题下都清楚。
+        """
+        return QColor("#FFFFFF")
+
+    def paintEvent(self, event) -> None:                 # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        radius = self.height() / 2
+        if self._progress < 0.99:                        # 关态：轨道描一圈边
+            painter.setPen(QPen(self.track_border(), 1))
+            painter.setBrush(self.track_color())
+            painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), radius, radius)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self.track_color())
+            painter.drawRoundedRect(self.rect(), radius, radius)
+
+        diameter = self.height() - self.KNOB_PAD * 2
+        left = self.KNOB_PAD
+        right = self.width() - self.KNOB_PAD - diameter
+        # 旋钮以"中心"定位，滑动途中沿运动方向拉长（拉长量对称摊在两侧）
+        width = diameter + self.knob_stretch()
+        center = lerp(left + diameter / 2, right + diameter / 2, self._progress)
+        x = int(round(center - width / 2))
+        painter.setBrush(self.knob_color())
+        if self._palette is not None and self._progress < 0.99:
+            painter.setPen(QColor(self._palette.border))     # 关态给旋钮一圈描边
+        painter.drawEllipse(x, self.KNOB_PAD, int(round(width)), diameter)
+        painter.end()
+
+    def mouseReleaseEvent(self, event) -> None:          # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(
+                event.position().toPoint()):
+            self.toggle()
+        super().mouseReleaseEvent(event)
+
+    def sizeHint(self) -> QSize:                         # noqa: N802
+        return QSize(self.TRACK_W, self.TRACK_H)
+
+
 class Toast(QFrame):
     """浮在窗口底部的提示气泡：淡入 + 上滑，超时自动消失，不参与布局。"""
 

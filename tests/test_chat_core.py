@@ -9,17 +9,23 @@
 """
 from __future__ import annotations
 
+import itertools
 import os
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mchat.core import seed, transport                                    # noqa: E402
-from mchat.core.models import (ChatKind, Conversation, Message, User,     # noqa: E402
+from mchat.core.crashlog import (CRASH_LOG_NAME,                          # noqa: E402
+                                 default_crash_log_path, install_crash_log)                                    # noqa: E402
+from mchat.core.models import (ChatKind, Conversation, Message, PinRef,   # noqa: E402
+                               User,
                                format_clock, format_day_label,
                                format_list_time, same_day)
-from mchat.core.store import MESSAGE, READ, ChatStore, StoreEvent         # noqa: E402
+from mchat.core.store import (CONFIRM_PREVIEW, MESSAGE, PIN, READ,        # noqa: E402
+                              ChatStore, StoreEvent, confirmation_preview)
 
 # 固定一个"现在"，让时间相关断言可重复（2026-09-27 21:30 本地时间）
 NOW = time.mktime((2026, 9, 27, 21, 30, 0, 0, 0, -1))
@@ -34,10 +40,18 @@ def _user(name: str, uid: str | None = None, **kw) -> User:
     return User(uid or name.lower(), name, **kw)
 
 
+_seed_ids = itertools.count(1)
+
+
 def _message(conv_id: str, text: str, ts: float, *, outgoing=False,
-             sender="lin", mid="m") -> Message:
-    return Message(id=mid, conversation_id=conv_id, sender_id=sender, text=text,
-                   ts=ts, outgoing=outgoing)
+             sender="lin", mid: str | None = None) -> Message:
+    """不传 ``mid`` 时自动生成唯一 id。
+
+    以前默认写死成 ``"m"``，于是夹具里三个会话的消息 id 全是 ``"m"`` ——
+    "按 id 批量删除"这类测试会被跨会话的同 id 带偏（删一条等于删三个会话的同 id 那条）。
+    """
+    return Message(id=mid or f"seed-{next(_seed_ids)}", conversation_id=conv_id,
+                   sender_id=sender, text=text, ts=ts, outgoing=outgoing)
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +396,200 @@ def test_clear_messages_only_one_conversation():
     assert store.unread("c1") == 0
     assert len(store.get("c2").messages) == 1        # 别的会话纹丝不动
     assert store.clear_messages("不存在") == 0
+
+
+# ---------------------------------------------------------------------------
+# 回复 / 置顶 / 转发（逐条 + 合并）/ 批量删除
+# ---------------------------------------------------------------------------
+def test_reply_ref_snapshot():
+    """引用快照：作者 + 一行摘要，太长截断；自己发的一律显示成"我"。"""
+    store = _store()
+    incoming = store.get("c-lin").messages[0]
+    ref = store.reply_ref(incoming)
+    assert ref.message_id == incoming.id
+    assert ref.author == "王尼玛" and ref.preview == "昨天的文件"
+    assert ref.text == "王尼玛：昨天的文件"
+    mine = store.reply_ref(_message("c-lin", "我发的一条", NOW, outgoing=True))
+    assert mine.author == "我"
+    long_ref = store.reply_ref(_message("c-lin", "很长" * 40, NOW))
+    assert len(long_ref.preview) == 42 and long_ref.preview.endswith("…")
+
+
+def test_peer_name_for_pin_dialog():
+    """置顶小窗要写"也为 XX 置顶"：单聊给对方名字，群聊给空串（那边改用"所有群成员"）。"""
+    store = _store()
+    assert store.get("c-lin").peer_name == "王尼玛"
+    assert store.get("c-chen").peer_name.strip() != ""
+    # 群聊里"对方"不唯一：peer_name 只是第一个不是你的人，
+    # 小窗上的文案由主窗口按会话类型决定（群聊写"所有群成员"）
+    assert store.get("c-group").kind is ChatKind.GROUP
+    assert store.get("c-group").peer_name != ""
+
+
+def test_pin_multiple_messages():
+    """多条置顶 + 每条都能选"仅我可见 / 双方可见"（Telegram 那两个选项）。"""
+    store = _store()
+    events: list[str] = []
+    store.subscribe(lambda event: events.append(event.kind))
+    first = store.get("c-lin").messages[0]
+    second = _message("c-lin", "第二条", NOW + 10, mid="m2")
+    third = _message("c-lin", "第三条", NOW + 20, mid="m3")
+    store.append(second)
+    store.append(third)
+    assert store.pin_message(first.id) is True                     # 默认：仅我可见
+    assert [pin.message_id for pin in store.get("c-lin").pins] == [first.id]
+    assert store.pin_ref("c-lin", first.id).for_both is False
+    assert store.pin_message(second.id, for_both=True) is True     # 这条对方也置顶
+    assert [(pin.message_id, pin.for_both) for pin in store.get("c-lin").pins] == [
+        (second.id, True), (first.id, False)]
+    assert store.pin_ref("c-lin", second.id).label == "双方可见"
+    assert store.pin_ref("c-lin", first.id).label == "仅我可见"
+    assert store.pin_message(third.id) is True
+    assert [pin.message_id for pin in store.get("c-lin").pins] == [third.id, second.id, first.id]
+    # 同一可见范围再点一次 = 取消这一条，别的留着
+    assert store.pin_message(second.id, for_both=True) is True
+    assert [pin.message_id for pin in store.get("c-lin").pins] == [third.id, first.id]
+    assert store.is_pinned("c-lin", second.id) is False
+    # 换了可见范围 = 就地改这一条（不新增、也不取消）
+    assert store.pin_message(first.id, for_both=True) is True
+    assert store.pin_ref("c-lin", first.id).for_both is True
+    assert [pin.message_id for pin in store.get("c-lin").pins] == [first.id, third.id]
+    # pinned_entries 给出 (消息, PinRef)，顺序跟着置顶顺序
+    entries = store.pinned_entries("c-lin")
+    assert [(m.id, pin.for_both) for m, pin in entries] == [(first.id, True), (third.id, False)]
+    assert store.unpin_message(first.id) is True                   # ✕ 取消某一条
+    assert [pin.message_id for pin in store.get("c-lin").pins] == [third.id]
+    assert store.unpin_message(first.id) is False                  # 已经没置顶了
+    assert store.pin_message("不存在的消息", for_both=True) is False
+    assert PIN in events
+
+
+def test_forward_one_by_one():
+    """逐条转发：一条对一条、带上来源、正文与附件跟着走、时间戳递增。"""
+    store = _store()
+    store.append(_message("c-lin", "第二条", NOW + 1, mid="m2"))
+    source = [message.id for message in store.get("c-lin").messages]
+    assert len(source) == 2
+    before = len(store.get("c-group").messages)
+    created = store.forward(source, "c-group", now=5000.0)
+    assert len(created) == len(source) == len(store.get("c-group").messages) - before
+    assert all(message.outgoing and message.conversation_id == "c-group"
+               for message in created)
+    assert [m.forwarded_from for m in created] == ["王尼玛"] * len(source)
+    assert [m.text for m in created] == [m.text for m in store.get("c-lin").messages]
+    assert created[0].ts < created[1].ts
+    assert created[0].is_forwarded and not created[0].is_merged
+
+
+def test_forward_merged():
+    """合并转发：只生成一条，内容是"N 条消息"，附件名也带上。"""
+    store = _store()
+    store.append(_message("c-lin", "", NOW + 5, mid="m2"))       # 纯附件式空消息
+    source = [message.id for message in store.get("c-lin").messages]
+    assert len(source) == 2
+    created = store.forward(source, "c-group", merge=True, now=6000.0)
+    assert len(created) == 1
+    merged = created[0]
+    assert merged.is_merged and merged.merged_count == 2
+    assert merged.forwarded_from == "王尼玛"
+    assert merged.text == "" and merged.merged_items[0].author == "王尼玛"
+    assert merged.merged_line(0) == "王尼玛：昨天的文件"
+    assert merged.preview_text == "【合并转发】2 条消息"
+    # 目标会话只多了一条
+    assert len([m for m in store.get("c-group").messages if m.is_merged]) == 1
+
+
+def test_forward_edge_cases():
+    """转发的边界：空列表 / 不存在的目标 / 不存在的消息都不该出事。"""
+    store = _store()
+    assert store.forward([], "c-group") == []
+    assert store.forward(["没有这条"], "c-group") == []
+    assert store.forward([store.get("c-lin").messages[0].id], "没有这个会话") == []
+    assert len(store.get("c-group").messages) == 1
+
+
+def test_delete_messages_deletes_anyone():
+    """本地删除（不是撤回）：**别人发的也能删**，删的是本机这份记录。"""
+    store = _store()
+    store.append(_message("c-lin", "我的一条", NOW + 1, outgoing=True, mid="m2"))
+    store.append(_message("c-lin", "我的另一条", NOW + 2, outgoing=True, mid="m3"))
+    other = store.get("c-lin").messages[0]                   # 别人发的（种子那条）
+    mine = [m for m in store.get("c-lin").messages if m.outgoing]
+    store.pin_message(other.id)                              # 置顶一条"别人的"消息
+    removed = store.delete_messages([m.id for m in mine] + [other.id])
+    assert removed == 3                                      # 三条都删掉了，不分谁发的
+    assert store.get("c-lin").messages == []
+    assert store.message(other.id) is None
+    assert store.get("c-lin").pins == ()                      # 置顶跟着清掉
+    assert store.delete_messages(["没有这条"]) == 0
+
+
+def test_delete_messages_only_mine_switch():
+    """``only_mine=True`` 留着"只清自己那几条"的场景（默认是都能删）。"""
+    store = _store()
+    store.append(_message("c-lin", "我的一条", NOW + 1, outgoing=True, mid="m2"))
+    other = store.get("c-lin").messages[0]
+    mine = [m for m in store.get("c-lin").messages if m.outgoing]
+    assert store.delete_messages([m.id for m in mine] + [other.id], only_mine=True) == 1
+    assert store.get("c-lin").messages == [other]            # 别人的那条留着
+    assert store.message(other.id) is not None
+
+
+def test_confirmation_preview():
+    """确认弹窗里的摘要：一行一条、超长截断、空消息有兜底文案。"""
+    store = _store()
+    lines = confirmation_preview([_message("c-lin", "很短", NOW),
+                                  _message("c-lin", "长" * 60, NOW)]).split("\n")
+    assert lines[0] == "· 很短"
+    assert len(lines[1]) == 2 + CONFIRM_PREVIEW + 1 and lines[1].endswith("…")
+    assert confirmation_preview([_message("c-lin", "", NOW)]) == "· （空消息）"
+
+
+def test_forward_payload_reaches_transport():
+    """合并转发自己没有 text，但**发出去时必须有载荷**。
+
+    传输层是拿 text 判"空消息"的：空消息既不触发对方"正在输入…"，也不给已读回执 ——
+    转发过去的东西因此会永远停在单勾、对面像没收到。这条测试把载荷与排期钉住。
+    """
+    store = _store()
+    source_message = store.get("c-lin").messages[0]
+    store.append(_message("c-lin", "", NOW + 5, mid="m2"))
+    merged = store.forward([m.id for m in store.get("c-lin").messages], "c-group",
+                           merge=True, now=6000.0)[0]
+    assert merged.text == ""                                  # 正文是空的……
+    assert merged.send_text == "【合并转发】2 条消息"           # ……载荷不能是空的
+    assert merged.merged_items[0].clock == format_clock(source_message.ts)   # 时间也带上了
+    # 普通消息原样；纯附件消息仍然返回空串（那种情况由 attachment 证明它不是空消息）
+    assert _message("c-lin", "普通消息", NOW).send_text == "普通消息"
+    assert _message("c-lin", "", NOW).send_text == ""
+    # 拿这句载荷喂传输层：typing + 回复 + 已读，三个事件都得排上
+    pipe = transport.LocalTransport({"c-group": transport.ReplyScript("su", ("收到",))},
+                                    clock=lambda: 0.0)
+    pipe.send(transport.Outgoing("c-group", "me", merged.send_text, merged.id))
+    assert pipe.pending() == 3
+
+
+def test_crash_log_keeps_evidence():
+    """崩溃要留现场：致命信号写栈、未捕获异常写 traceback（都是"窗口突然消失"时唯一的线索）。"""
+    path = os.path.join(tempfile.gettempdir(), "mchat-crash-test.log")
+    if os.path.exists(path):
+        os.remove(path)
+    old_hook = sys.excepthook
+    try:
+        assert install_crash_log(path) == path
+        assert os.path.isfile(path)                      # 文件建起来了（faulthandler 已装）
+        assert default_crash_log_path(r"C:\data").endswith(CRASH_LOG_NAME)
+        try:
+            raise RuntimeError("模拟一次崩溃")
+        except RuntimeError:
+            sys.excepthook(*sys.exc_info())              # 模拟"没人接住的异常"
+        text = open(path, encoding="utf-8").read()
+        assert "未捕获异常" in text and "RuntimeError" in text
+        assert "模拟一次崩溃" in text
+    finally:
+        sys.excepthook = old_hook                        # 别把全局钩子留在测试进程里
+        # 日志文件不删：faulthandler 还拿着它的句柄（Windows 上删不掉，也不该删 ——
+        # 它正是"崩溃现场"，下次崩溃会接着往同一个文件写）。
 
 
 def _run_all() -> int:
