@@ -20,18 +20,32 @@ import itertools
 import time
 from dataclasses import dataclass, field
 
-from .models import Attachment, Conversation, Message, ReplyRef
+from .models import Attachment, Conversation, Message, ReplyRef, User
 
 __all__ = ["Outgoing", "TransportEvent", "ChatTransport", "ReplyScript",
            "LocalTransport", "NullTransport",
            "EVENT_MESSAGE", "EVENT_TYPING", "EVENT_READ", "EVENT_CONVERSATION",
-           "EVENT_RESYNC"]
+           "EVENT_PIN", "EVENT_REACTION", "EVENT_PRESENCE", "EVENT_RESYNC",
+           "EVENT_FRIEND_REQUEST", "EVENT_FRIEND_ACCEPT", "EVENT_FRIEND_REJECT",
+           "EVENT_FRIEND_REMOVE", "EVENT_SEND_BLOCKED", "FRIEND_EVENT_KINDS"]
 
 EVENT_MESSAGE = "message"
 EVENT_TYPING = "typing"
 EVENT_READ = "read"
 EVENT_CONVERSATION = "conversation"     # 有人拉我进了新会话（联网时服务端推的）
+EVENT_PIN = "pin"                       # 会话内置顶变了（"双方可见"的那种才由服务端推）
+EVENT_REACTION = "reaction"             # 有人给某条消息加了/撤了表情回应
+EVENT_PRESENCE = "presence"             # 某人上线/下线了（别人那边的小绿点要跟着变）
 EVENT_RESYNC = "resync"                 # 事件流水断了：界面重新拉一次会话列表
+# ---- 好友 ----------------------------------------------------------------
+EVENT_FRIEND_REQUEST = "friend_request"   # 有人申请加我（或我自己那侧的回显）
+EVENT_FRIEND_ACCEPT = "friend_accept"     # 我发出去的申请被同意了
+EVENT_FRIEND_REJECT = "friend_reject"     # 我发出去的申请被拒了
+EVENT_FRIEND_REMOVE = "friend_remove"     # 对方把我删了（或我在别处删的）
+#: 这四种事件的形状一样（都带 ``user``），界面/仓库统一处理
+FRIEND_EVENT_KINDS = (EVENT_FRIEND_REQUEST, EVENT_FRIEND_ACCEPT,
+                      EVENT_FRIEND_REJECT, EVENT_FRIEND_REMOVE)
+EVENT_SEND_BLOCKED = "send_blocked"       # 我发的消息被好友门禁拦成了申请（不重发）
 
 
 @dataclass(frozen=True)
@@ -73,6 +87,14 @@ class TransportEvent:
     attachment: Attachment | None = None
     message: Message | None = None
     conversation: Conversation | None = None
+    pinned: bool = True        # EVENT_PIN 用：是置顶还是取消置顶
+    pinned_by_name: str = ""   # EVENT_PIN / EVENT_REACTION 用：谁干的（要说清是谁）
+    emoji: str = ""            # EVENT_REACTION 用：哪个表情
+    added: bool = True         # EVENT_REACTION 用：是加还是撤
+    reactions: tuple = ()      # EVENT_REACTION 用：服务端算好的整份回应清单
+    online: bool = True        # EVENT_PRESENCE 用：这个人在线还是离线
+    user: "User | None" = None  # EVENT_FRIEND_* 用：申请/同意的"另一个人"
+    note: str = ""             # EVENT_FRIEND_REQUEST / EVENT_SEND_BLOCKED 用：留言
 
 
 @dataclass

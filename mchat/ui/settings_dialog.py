@@ -167,6 +167,8 @@ class SettingsDialog(QDialog):
     themeChanged = pyqtSignal(str)
     fontScaleChanged = pyqtSignal(float)
     animationsToggled = pyqtSignal(bool)
+    notifyToggled = pyqtSignal(bool)
+    soundToggled = pyqtSignal(bool)
     openDataDirRequested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
@@ -267,11 +269,34 @@ class SettingsDialog(QDialog):
         self.about_label.setObjectName("settingHint")
         self.about_label.setWordWrap(True)
         about.add_control(self.about_label)
-        return [look, motion, data, about]
+
+        # ---- 消息通知：桌面通知 + 提示音 ----
+        # 放在最后（而不是夹在中间）：卡片下标是既有测试的锚点，加新卡片不动老下标。
+        notice = SettingsCard("消息通知", "收到新消息时弹一条系统通知 / 响一声提示音")
+        self.notify_switch = ToggleSwitch(True, self)
+        self.notify_switch.toggled.connect(self._on_notify_toggled)
+        self.notify_value = QLabel("", self)
+        self.notify_value.setObjectName("settingValue")
+        notice.add_trailing(self.notify_value)
+        self.notify_hint = QLabel("", self)
+        self.notify_hint.setObjectName("settingHint")
+        self.notify_hint.setWordWrap(True)
+        notice.add_control_row(self.notify_switch, self.notify_hint)
+        self.sound_switch = ToggleSwitch(True, self)
+        self.sound_switch.toggled.connect(self._on_sound_toggled)
+        self.sound_value = QLabel("", self)
+        self.sound_value.setObjectName("settingValue")
+        notice.add_trailing(self.sound_value)
+        self.sound_hint = QLabel("", self)
+        self.sound_hint.setObjectName("settingHint")
+        self.sound_hint.setWordWrap(True)
+        notice.add_control_row(self.sound_switch, self.sound_hint)
+        return [look, motion, data, about, notice]
 
     # ================================================================== 状态同步
     def sync(self, *, theme_name: str | None = None, font_scale: float | None = None,
              animations: bool | None = None, stats: dict | None = None,
+             notifications: bool | None = None, sound: bool | None = None,
              data_path: str = "", transport: str = "") -> None:
         """把主窗口的当前状态贴到控件上（都走 ``notify=False``，不回抛信号）。"""
         if theme_name is not None:
@@ -293,6 +318,18 @@ class SettingsDialog(QDialog):
             self.motion_hint.setText(" "
                                      if animations else
                                      "关闭")
+        if notifications is not None:
+            self.notify_switch.set_checked(notifications, animate=False, notify=False)
+            self.notify_value.setText("开启" if notifications else "已关闭")
+            self.notify_hint.setText("新消息会弹系统通知（不看这个窗口时）"
+                                     if notifications else
+                                     "已关闭：收到消息不再弹系统通知")
+        if sound is not None:
+            self.sound_switch.set_checked(sound, animate=False, notify=False)
+            self.sound_value.setText("开启" if sound else "已关闭")
+            self.sound_hint.setText("新消息会响一声提示音"
+                                    if sound else
+                                    "已关闭：收到消息不响提示音")
         if stats is not None:
             self.stats_label.setText(
                 f"消息 {stats.get('messages', 0)} 条 · 附件 {stats.get('attachments', 0)} 个 · "
@@ -313,6 +350,12 @@ class SettingsDialog(QDialog):
 
     def animations_enabled(self) -> bool:
         return self.motion_switch.is_checked()
+
+    def notifications_enabled(self) -> bool:
+        return self.notify_switch.is_checked()
+
+    def sound_enabled(self) -> bool:
+        return self.sound_switch.is_checked()
 
     def card_count(self) -> int:
         return len(self.cards)
@@ -389,6 +432,20 @@ class SettingsDialog(QDialog):
                                  "已关掉：所有动效直接落终态（省电、也便于截图对比）")
         self.animationsToggled.emit(enabled)
 
+    def _on_notify_toggled(self, enabled: bool) -> None:
+        self.notify_value.setText("开启" if enabled else "已关闭")
+        self.notify_hint.setText("新消息会弹系统通知（不看这个窗口时）"
+                                 if enabled else
+                                 "已关闭：收到消息不再弹系统通知")
+        self.notifyToggled.emit(enabled)
+
+    def _on_sound_toggled(self, enabled: bool) -> None:
+        self.sound_value.setText("开启" if enabled else "已关闭")
+        self.sound_hint.setText("新消息会响一声提示音"
+                                if enabled else
+                                "已关闭：收到消息不响提示音")
+        self.soundToggled.emit(enabled)
+
     # ================================================================== 皮肤
     def apply_palette(self, palette) -> None:
         """整套样式表 + 各控件重上色（字号也在这里跟着 theme.font_scale() 走）。"""
@@ -397,6 +454,8 @@ class SettingsDialog(QDialog):
         self.theme_control.apply_palette(palette)
         self.font_control.apply_palette(palette)
         self.motion_switch.apply_palette(palette)
+        self.notify_switch.apply_palette(palette)
+        self.sound_switch.apply_palette(palette)
         for card in self.cards:
             card.apply_palette(palette)
         for label in (self.foot, self.data_path_label):

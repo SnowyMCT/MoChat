@@ -21,10 +21,11 @@ from __future__ import annotations
 import html
 from html import escape
 
+from ..core.models import ellipsize
 from . import flags as flag_data
 
 __all__ = ["TEXT_IMAGE_SIZE", "PREVIEW_IMAGE_SIZE", "contains_flag", "split_flags",
-           "to_html", "to_display", "assets_available"]
+           "to_html", "to_display", "truncate", "assets_available"]
 
 TEXT_IMAGE_SIZE = 18            # 气泡/输入框里旗帜的显示边长（正文 13.5px）
 PREVIEW_IMAGE_SIZE = 14         # 会话摘要那行矮，图也小一点
@@ -114,6 +115,19 @@ def to_html(text: str, *, size: int = TEXT_IMAGE_SIZE) -> str:
             out.append(escaped[index])
             index += 1
     return "".join(out).replace("\n", "<br>")
+
+
+def truncate(text: str, limit: int, *, ellipsis: str = "…") -> str:
+    """按字符数截断给用户看，但**绝不把一面旗帜切成两半**。
+
+    为什么需要它：置顶横幅、会话摘要这类地方都是"取前面几十个字"，
+    直接切字符串很容易正好切在两字符旗帜的中间 —— 剩下一半会渲染成一个
+    字母方块（看起来像乱码）。切完把落单的那一半去掉即可。
+
+    实现只有一份：``core.models.ellipsize``（数据层也要用它，见会话摘要与回复引用），
+    这里只是 UI 侧沿用的名字。
+    """
+    return ellipsize(text, limit, ellipsis=ellipsis)
 
 
 def to_display(text: str, *, size: int = TEXT_IMAGE_SIZE) -> tuple[str, bool]:

@@ -36,7 +36,7 @@ from mchat.core import assets as core_assets                            # noqa: 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import seed                                                             # noqa: E402
 from mchat.core.db import ChatLog                                       # noqa: E402
-from mchat.core.models import Attachment, Message, PinRef               # noqa: E402
+from mchat.core.models import Attachment, MergedItem, Message, PinRef       # noqa: E402
 from mchat.core.transport import LocalTransport                         # noqa: E402
 from mchat.ui import emoji, flags as flags_data                         # noqa: E402
 from mchat.ui import main_window as main_window_module                  # noqa: E402
@@ -1057,8 +1057,8 @@ def main() -> int:
     # 断言"正在入场"不能靠"睡一小会儿再看"：机器忙的时候 pump 会超时，动画可能已经跑完
     # （实测偶发翻车一次）。show() 里是同步启动动画的，所以直接就查状态。
     check("打开时整窗在动（淡入 + 从下往上滑）", dialog.is_entering())
-    check("四张卡片（外观 / 动效 / 数据 / 关于）",
-          dialog.card_count() == 4, str(dialog.card_count()))
+    check("五张卡片（外观 / 动效 / 数据 / 关于 / 消息通知）",
+          dialog.card_count() == 5, str(dialog.card_count()))
     check("入场结束后不留透明效果（稳态零开销）",
           wait_for(app, lambda: not dialog.is_entering()
                    and dialog.graphicsEffect() is None
@@ -1694,10 +1694,10 @@ def main() -> int:
           card.title_label.text() if card else "没有卡片")
     first_author = merged_message.merged_items[0].author
     check("卡片上只有一行摘要（作者：内容），不把全部内容塞进气泡",
-          card.preview_label.text() == merged_message.merged_preview()
-          and chr(10) not in card.preview_label.text()
-          and card.preview_label.text().startswith(f"{first_author}："),
-          card.preview_label.text())
+          card.preview_text() == merged_message.merged_preview()
+          and chr(10) not in card.preview_text()
+          and card.preview_text().startswith(f"{first_author}："),
+          card.preview_text())
     check("卡片底部写着「查看 N 条转发消息」",
           card.count_text() == "查看 3 条转发消息 ›", card.count_text())
     check("卡片里每条都记了原消息的时间（查看窗口要显示）",
@@ -2214,6 +2214,96 @@ def main() -> int:
           and shot_bubble.text_label.textFormat() == Qt.TextFormat.RichText
           and shot_bubble.text_label.text().count("<img") == 4,
           shot_bubble.text_label.text()[:120] if shot_bubble else "没找到气泡")
+
+    # 置顶横幅是**另一处** QTextDocument 渲染的文本：国旗同样要换成图
+    # （回归：气泡里是图、置顶栏里却一直是 "JP/US" 字母 —— 就是漏了这一处）
+    check("置顶一条带国旗的消息", win.toggle_pin_message("in-flag-shot", for_both=False) is True)
+    pump(app, 240)
+    flag_banner = win.chat_view.pin_banner
+    check("置顶横幅里的国旗也是图片（不是 CN 字母）",
+          win.chat_view.pinned_message_id() == "in-flag-shot"
+          and flag_banner.text_label.textFormat() == Qt.TextFormat.RichText
+          and flag_banner.text_label.text().count("<img") == 4,
+          flag_banner.text_label.text()[:140])
+    shoot("light_pin_flag")
+    # 光看标签文本里写着 <img> 还不够：素材没画出来时文本照样是 <img>。
+    # 数一次横幅区域里的彩色像素 —— 国旗是彩色图，退化成 "JP" 字母时这里会掉到 0 附近。
+    banner_colors = colorful_pixels(win, flag_banner.text_label)
+    check("置顶横幅里真的画出了彩色国旗（不只是标签里写着 <img>）",
+          banner_colors > 300, str(banner_colors))
+
+    # 同一类漏网之鱼：回复条 / 引用块 / 合并转发 / 搜索结果都是 QTextDocument 渲染的
+    # 消息文本 —— 国旗都得是图片（此前只有气泡和侧栏做了转换）
+    flag_ref = win.start_reply("in-flag-shot")
+    pump(app, 200)
+    reply_bar = win.chat_view.composer.reply_bar
+    check("回复条里的国旗也是图片",
+          flag_ref is not None and reply_bar.isVisible()
+          and reply_bar.text_label.textFormat() == Qt.TextFormat.RichText
+          and reply_bar.text_label.text().count("<img") == 4
+          and reply_bar.text() == flag_ref.preview,
+          reply_bar.text_label.text()[:140])
+    win.chat_view.set_input_text("收到，那就带上 🇯🇵 那面")
+    win.send_message("收到，那就带上 🇯🇵 那面")
+    pump(app, 320)
+    sent_flag = next((m for m in win.store.get(seed.CHAT_GROUP).messages
+                      if m.text.startswith("收到，那就带上")), None)
+    sent_bubble = (win.chat_view.message_list.bubbles().get(sent_flag.id)
+                   if sent_flag is not None else None)
+    check("气泡里引用块的国旗也是图片（原文仍按纯文本返回）",
+          sent_bubble is not None and sent_bubble.quote is not None
+          and sent_bubble.quote.text_label.textFormat() == Qt.TextFormat.RichText
+          and sent_bubble.quote.text_label.text().count("<img") == 4
+          and sent_bubble.quote_text() == f"{flag_ref.author}：{flag_ref.preview}",
+          sent_bubble.quote_text() if sent_bubble else "没有引用块")
+
+    # 合并转发：卡片那一行摘要 + "查看聊天记录"窗口里逐条正文，国旗同样要换图
+    merged_flag = Message(
+        id="in-merged-flag", conversation_id=seed.CHAT_GROUP, sender_id="su", text="",
+        ts=time.time() + 6, outgoing=False,
+        merged_items=(MergedItem("尼玛", "看这面 🇨🇳 和这面 🇯🇵", "", "09:00"),
+                      MergedItem("我", "收到 🏴‍☠️", "", "09:01")))
+    win.store.receive(merged_flag)
+    pump(app, 320)
+    merged_card = win.chat_view.message_list.bubbles()["in-merged-flag"].merged_card
+    check("合并转发卡片摘要里的国旗是图片（preview_text 仍是原文）",
+          merged_card is not None
+          and merged_card.preview_label.textFormat() == Qt.TextFormat.RichText
+          and merged_card.preview_label.text().count("<img") == 2
+          and merged_card.preview_text() == merged_flag.merged_preview(),
+          merged_card.preview_label.text()[:140] if merged_card else "没有卡片")
+    flag_viewer = win.open_merged_view("in-merged-flag")
+    flag_viewer.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    pump(app, 260)
+    check("「聊天记录」窗口里每条正文的国旗也是图片",
+          [row.body_label.textFormat() for row in flag_viewer._rows]
+          == [Qt.TextFormat.RichText, Qt.TextFormat.RichText]
+          and [row.body_label.text().count("<img") for row in flag_viewer._rows] == [2, 1]
+          and flag_viewer.body_texts() == [i.text for i in merged_flag.merged_items],
+          str(flag_viewer.body_texts()))
+
+    # 搜索结果：命中片段那一行同样是 QTextDocument 渲染的文本
+    win.store.receive(Message(id="in-search-flag", conversation_id=seed.CHAT_GROUP,
+                              sender_id="su", text="国旗测试 🇨🇳 关键词语",
+                              ts=time.time() + 8, outgoing=False))
+    pump(app, 300)
+    flag_search = win.open_search()
+    flag_search.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    flag_search.set_query("关键词语")
+    hit_count = flag_search.run_search()
+    hit_row = flag_search._rows[0] if flag_search._rows else None
+    check("搜索结果里的国旗也是图片",
+          hit_count >= 1 and hit_row is not None
+          and hit_row.snippet_label.textFormat() == Qt.TextFormat.RichText
+          and hit_row.snippet_label.text().count("<img") == 1,
+          hit_row.snippet_label.text()[:140] if hit_row else "没有结果")
+    flag_search.close()
+    # 一张图把"回复条 + 置顶横幅 + 合并转发卡片"都框进去，人工复核旗帜真的是彩图
+    shoot("light_flag_everywhere")
+
+    check("取消置顶后横幅收起来",
+          win.unpin_current("in-flag-shot") is True
+          and win.chat_view.pinned_message_id() == "" and not flag_banner.isVisible())
 
     # 附件：图片消息（演示数据里那条）+ 一条文件消息，人工复核缩略图比例、卡片排版
     win.select_conversation(seed.CHAT_DESIGN)

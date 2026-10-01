@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
                              QScrollArea, QVBoxLayout, QWidget)
 
 from .avatar import Avatar
+from . import flag_text
 from .theme import build_qss
 
 __all__ = ["MergedViewerDialog"]
@@ -41,9 +42,17 @@ class MergedRow(QWidget):
         head.addWidget(self.clock_label)
         head.addStretch(1)
 
-        self.body_label = QLabel(item.text if item.text.strip() else "", self)
+        self.body_label = QLabel(self)
         self.body_label.setObjectName("mergedBody")
         self.body_label.setWordWrap(True)
+        # 聊天记录窗口里逐条列的是"别人的原话"：国旗要换成 <img>（否则只有 "JP" 字母），
+        # 其余原样转义 —— 和气泡正文同一套（见 ui/flag_text.py）
+        self._plain_text = item.text if item.text.strip() else ""
+        payload, rich = flag_text.to_display(self._plain_text,
+                                             size=flag_text.PREVIEW_IMAGE_SIZE)
+        self.body_label.setText(payload)
+        self.body_label.setTextFormat(Qt.TextFormat.RichText if rich
+                                      else Qt.TextFormat.PlainText)
         self.body_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)      # 能选中复制，像真的聊天记录
 
@@ -79,8 +88,12 @@ class MergedRow(QWidget):
     def apply_palette(self, palette) -> None:
         self.avatar.apply_palette(palette)
 
+    def body(self) -> str:
+        """这条记录的原话（富文本时 ``body_label.text()`` 是 HTML，所以这里存了原串）。"""
+        return self._plain_text
+
     def texts(self) -> tuple[str, str, str]:
-        return (self.nick_label.text(), self.clock_label.text(), self.body_label.text())
+        return (self.nick_label.text(), self.clock_label.text(), self.body())
 
 
 class MergedViewerDialog(QDialog):
@@ -162,7 +175,7 @@ class MergedViewerDialog(QDialog):
         return [row.texts() for row in self._rows]
 
     def body_texts(self) -> list[str]:
-        return [row.body_label.text() for row in self._rows]
+        return [row.body() for row in self._rows]
 
     def apply_palette(self, palette) -> None:
         self._palette = palette

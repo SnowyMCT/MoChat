@@ -16,11 +16,15 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable
 
-from .models import (ME_ID, ChatKind, Conversation, MergedItem, Message, PinRef,
-                     ReplyRef, format_clock)
+from .models import (ME_ID, ChatKind, Conversation, Friend, FriendRequest,
+                     MergedItem, Message, PinRef, ReplyRef, ellipsize,
+                     format_clock)
+# 好友事件的 kind 与传输层是同一套字符串（这里只认"能确定方向"的那几种）
+from .transport import (EVENT_FRIEND_ACCEPT, EVENT_FRIEND_REJECT,
+                        EVENT_FRIEND_REMOVE)
 
 __all__ = ["StoreEvent", "ChatStore", "confirmation_preview"]
 
@@ -28,6 +32,7 @@ MESSAGE = "message"
 READ = "read"
 RESET = "reset"
 PIN = "pin"                  # 会话内置顶变了（气泡右键菜单里的"置顶"）
+FRIENDS = "friends"          # 好友 / 待处理申请变了（好友页面与角标要跟着刷）
 
 CONFIRM_PREVIEW = 24         # 确认弹窗里一条消息最多展示几个字
 
@@ -61,6 +66,10 @@ class ChatStore:
         self._order: list[str] = []
         self._unread: dict[str, int] = {}
         self._listeners: list[Callable[[StoreEvent], None]] = []
+        # 好友关系（key 都是对方的 user id）。服务端是权威，这里只是"当前这一份"。
+        self._friends: dict[str, Friend] = {}
+        self._incoming: dict[str, FriendRequest] = {}
+        self._outgoing: dict[str, FriendRequest] = {}
         for conv in conversations:
             self.add_conversation(conv)
 
@@ -139,6 +148,85 @@ class ChatStore:
         return hits
 
     # ==================================================================
+    # 好友（服务端是权威，这里存的是"当前这一份"）
+    # ==================================================================
+    def friends(self) -> list[Friend]:
+        """好友列表（按服务端给的顺序）。"""
+        with self._lock:
+            return list(self._friends.values())
+
+    def friend(self, user_id: str) -> Friend | None:
+        with self._lock:
+            return self._friends.get(str(user_id or ""))
+
+    def is_friend(self, user_id: str) -> bool:
+        with self._lock:
+            return str(user_id or "") in self._friends
+
+    def incoming_requests(self) -> list[FriendRequest]:
+        """别人申请加我、还没处理的（``user`` 是申请人）。"""
+        with self._lock:
+            return list(self._incoming.values())
+
+    def outgoing_requests(self) -> list[FriendRequest]:
+        """我申请加别人、还没被回应的（``user`` 是被申请人）。"""
+        with self._lock:
+            return list(self._outgoing.values())
+
+    def friend_request_count(self) -> int:
+        """待处理申请数 —— 侧栏那个红点角标用的就是它。"""
+        with self._lock:
+            return len(self._incoming)
+
+    def set_friends(self, friends=(), incoming=(), outgoing=()) -> None:
+        """整份替换好友与申请（``GET /api/friends`` 回来时调；服务端是权威）。
+
+        三段都可以不给：不给的段保持原样，方便只刷新其中一部分。
+        """
+        with self._lock:
+            if friends is not None:
+                self._friends = {friend.user_id: friend for friend in friends
+                                 if friend.user_id}
+            if incoming is not None:
+                self._incoming = {item.user_id: item for item in incoming
+                                  if item.user_id}
+            if outgoing is not None:
+                self._outgoing = {item.user_id: item for item in outgoing
+                                  if item.user_id}
+        self._emit(StoreEvent(FRIENDS))
+
+    def apply_friend_event(self, kind: str, user, note: str = "",
+                           ts: float = 0.0) -> bool:
+        """收到一条好友推送事件：把**能确定**的那部分就地更新，返回是否真的变了。
+
+        有几件事光看事件是分不出来的：``friend_request`` 事件推给申请人和被申请人时
+        长得一模一样（都是 ``user = 申请人``），所以它到底该进 ``incoming`` 还是
+        ``outgoing`` 只有服务端知道。这里只处理方向明确的那几种，剩下的交给界面
+        拉一次 ``/api/friends`` 对账 —— ``set_friends`` 一落，状态就是权威的，
+        顺带把多设备的情况也覆盖了。
+        """
+        user_id = str(getattr(user, "id", "") or "")
+        if not user_id:
+            return False
+        with self._lock:
+            if kind == EVENT_FRIEND_ACCEPT and not getattr(user, "is_me", False):
+                # 对方同意了我发出去的申请 → 从这天起是好友
+                self._outgoing.pop(user_id, None)
+                self._incoming.pop(user_id, None)
+                self._friends[user_id] = Friend(user, float(ts or 0.0))
+            elif kind == EVENT_FRIEND_REJECT and not getattr(user, "is_me", False):
+                self._outgoing.pop(user_id, None)
+            elif kind == EVENT_FRIEND_REMOVE:
+                # 谁删的都一样：这段关系没了（历史会话与消息保留）
+                self._friends.pop(user_id, None)
+                self._incoming.pop(user_id, None)
+                self._outgoing.pop(user_id, None)
+            else:
+                return False
+        self._emit(StoreEvent(FRIENDS, user_id))
+        return True
+
+    # ==================================================================
     # 写入
     # ==================================================================
     def add_conversation(self, conv: Conversation, *, unread: int = 0) -> None:
@@ -212,11 +300,9 @@ class ChatStore:
     # 回复 / 置顶 / 转发 / 批量删除（气泡右键菜单那一套）
     # ==================================================================
     def reply_ref(self, message: Message, *, limit: int = 42) -> ReplyRef:
-        """给\"回复\"造一个引用快照：作者 + 一行摘要（太长就截断）。"""
+        """给"回复"造一个引用快照：作者 + 一行摘要（太长就截断，不切出半面旗）。"""
         text = " ".join(message.preview_text.split()) or "（空消息）"
-        if len(text) > limit:
-            text = text[:limit - 1] + "…"
-        return ReplyRef(message.id, self.author_name(message), text)
+        return ReplyRef(message.id, self.author_name(message), ellipsize(text, limit))
 
     def pin_message(self, message_id: str, *, for_both: bool = False) -> bool:
         """置顶一条：可选**对方也置顶**（``for_both=True``），默认只在自己这边。
@@ -368,6 +454,38 @@ class ChatStore:
         self._emit(StoreEvent(RESET, conversation_id))
         return True
 
+    def set_member_online(self, conversation_id: str, user_id: str,
+                          online: bool) -> bool:
+        """把某个会话里某人的在线状态改掉，返回是否真的变了。
+
+        **千万不要写成 ``member.online = ...``**：``User`` 是 frozen dataclass，
+        那样赋值会抛 ``FrozenInstanceError``。这个异常原来就发生在 ``tick()``
+        这条事件轮询上（Qt 定时器槽），一抛整条 tick 就断在那里 ——
+        表现出来正是"好友上线了，我这边小绿点/第二行还写着离线"。
+        frozen 对象要换状态只能 ``replace()`` 出一个新的成员对象放回列表。
+        """
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None:
+                return False
+            for index, member in enumerate(conversation.members):
+                if member.id != user_id or member.online == bool(online):
+                    continue
+                conversation.members[index] = replace(member, online=bool(online))
+                return True
+        return False
+
+    def set_user_online(self, user_id: str, online: bool) -> list[str]:
+        """把某人在**所有会话**里的在线状态一起改掉，返回真的变了的会话 id。
+
+        一条 presence 事件要同时照顾"他在的每一个单聊/群"：他可能既跟我有单聊、
+        又在同一个群里，两处的小绿点都得跟着变。
+        """
+        with self._lock:
+            ids = list(self._conversations)
+        return [cid for cid in ids
+                if self.set_member_online(cid, user_id, online)]
+
     def clear_messages(self, conversation_id: str) -> int:
         """清空**某一个**会话的消息（会话本身留着），返回删掉几条。"""
         with self._lock:
@@ -424,6 +542,27 @@ class ChatStore:
                     break
         if target is not None:
             self._emit(StoreEvent(MESSAGE, conversation_id, target))
+
+    def set_message_status(self, conversation_id: str, message_id: str,
+                           status: str) -> bool:
+        """改一条本地消息的状态（``sent`` / ``read`` / ``blocked``），并通知界面刷新。
+
+        ``blocked`` 是"撞上好友门禁、没发出去"：服务端不落库，本地那条乐观显示的
+        消息得从"✓（已发出）"改成明确的样子，不能一直挂着像发出去了。
+        """
+        with self._lock:
+            conv = self._conversations.get(conversation_id)
+            if conv is None:
+                return False
+            for msg in conv.messages:
+                if msg.id == message_id:
+                    msg.status = str(status)
+                    target = msg
+                    break
+            else:
+                return False
+        self._emit(StoreEvent(MESSAGE, conversation_id, target))
+        return True
 
     # ==================================================================
     # 变更订阅

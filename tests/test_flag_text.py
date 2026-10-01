@@ -104,6 +104,54 @@ def test_split_flags_plain_text():
 # ---------------------------------------------------------------------------
 # 显示决策
 # ---------------------------------------------------------------------------
+def test_truncate_never_splits_a_flag():
+    """按字符截断**不能把两面国旗切开**：切开后剩下半个会渲染成字母方块。
+
+    横幅/摘要只取前几十个字，这一步是"切在旗帜中间"的唯一防线。
+    """
+    flag = F.FLAG_CHARS[0]                       # 两字符旗（🇨🇳 这种）
+    half = 0x1F1E6 <= ord(flag[0]) <= 0x1F1FF
+    assert half, flag
+
+    def lone_half(text: str) -> bool:
+        """有没有**落单**的半个旗子（渲染出来是个字母方块）。
+
+        注意判的是"落单"：一整面旗子本来就由两个 regional indicator 组成，
+        光看"有没有这个范围的字符"会把完整的旗子也误判。
+        """
+        def is_half(char: str) -> bool:
+            return len(char) == 1 and 0x1F1E6 <= ord(char) <= 0x1F1FF
+
+        for index, char in enumerate(text):
+            if not is_half(char):
+                continue
+            pair = is_half(text[index - 1:index]) or is_half(text[index + 1:index + 2])
+            if not pair:
+                return True
+        return False
+
+    text = "x" * 5 + flag + "尾巴"
+    assert flag_text.truncate(text, 100) == text, "没超长就不该动它"
+    assert flag_text.truncate(text, 0) == text, "limit<=0 表示不截断"
+
+    # 正好切在旗子中间：limit-1 = 6 → 切出 "xxxxx" + 半个旗 → 那半个要去掉
+    cut = flag_text.truncate("x" * 5 + flag + "yy", 7)
+    assert cut == "x" * 5 + "…", repr(cut)
+    assert not lone_half(cut), "还剩半个旗子"
+
+    # 旗子完整地在窗口里：要保留整面旗，不能为了"不半切"把它一起丢掉
+    keep = flag_text.truncate("x" * 4 + flag + "尾巴尾", 8)
+    assert keep.startswith("x" * 4 + flag), repr(keep)
+    assert keep.endswith("…") and not lone_half(keep), repr(keep)
+    assert not lone_half("前缀" + flag), "整面旗子不该被判成半个"
+
+    # 截断之后照样能换成图（半面旗会被丢掉，剩下的整面旗还是图）
+    payload, _ = flag_text.to_display(flag_text.truncate("x" * 5 + flag + flag, 6))
+    assert payload.count("<img") == 0 and payload.endswith("…"), payload   # 只留 xxxxx…
+    payload2, rich2 = flag_text.to_display("前缀" + flag)
+    assert rich2 and payload2.count("<img") == 1, payload2
+
+
 def test_to_display_plain_when_no_flag():
     payload, rich = flag_text.to_display("普通消息 <b>不转义</b>")
     assert payload == "普通消息 <b>不转义</b>"          # 纯文本路径一个字都不动

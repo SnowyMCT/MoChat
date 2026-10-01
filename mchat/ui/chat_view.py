@@ -187,11 +187,23 @@ class QuoteBox(QFrame):
         self.author_label = QLabel(reply.author or "消息", self)
         self.author_label.setObjectName("quoteAuthor")
         column.addWidget(self.author_label)
-        self.text_label = QLabel(reply.preview, self)
+        self._plain_text = reply.preview
+        self.text_label = QLabel(self)
         self.text_label.setObjectName("quoteText")
+        # 引用块也是 QTextDocument 渲染的文本：国旗要换成 <img>，否则 Windows 只肯画成
+        # "JP" 两个字母（气泡正文、置顶横幅都换成图了，这里漏了）
+        payload, rich = flag_text.to_display(reply.preview,
+                                             size=flag_text.PREVIEW_IMAGE_SIZE)
+        self.text_label.setText(payload)
+        self.text_label.setTextFormat(Qt.TextFormat.RichText if rich
+                                      else Qt.TextFormat.PlainText)
         self.text_label.setWordWrap(True)
         self.text_label.setMaximumWidth(MAX_BUBBLE_WIDTH - 60)
         column.addWidget(self.text_label)
+
+    def text(self) -> str:
+        """引用原文（富文本时 ``text_label.text()`` 是 HTML，所以这里存了原串）。"""
+        return self._plain_text
 
     def mouseReleaseEvent(self, event) -> None:          # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
@@ -223,11 +235,17 @@ class MergedCard(QFrame):
         self.title_label = QLabel(f"{message.forwarded_from or '聊天'} 的聊天记录", self)
         self.title_label.setObjectName("mergeTitle")
         column.addWidget(self.title_label)
-        self.preview_label = QLabel(message.merged_preview(), self)
+        self._plain_preview = message.merged_preview()
+        self.preview_label = QLabel(self)
         self.preview_label.setObjectName("mergePreview")
         self.preview_label.setMaximumWidth(MAX_BUBBLE_WIDTH - 60)
-        # 合并转发里是"别人的原话"，必须按纯文本画（一条带 <b> 的消息不该变成富文本）
-        self.preview_label.setTextFormat(Qt.TextFormat.PlainText)
+        # 合并转发里是"别人的原话"：一条带 <b> 的消息不该变成富文本 —— to_display 会先
+        # 转义再插图，正好两件事一起办；国旗仍要换成 <img>（否则只有 "JP" 字母）
+        payload, rich = flag_text.to_display(self._plain_preview,
+                                             size=flag_text.PREVIEW_IMAGE_SIZE)
+        self.preview_label.setText(payload)
+        self.preview_label.setTextFormat(Qt.TextFormat.RichText if rich
+                                        else Qt.TextFormat.PlainText)
         column.addWidget(self.preview_label)
         self.footer_label = QLabel(f"查看 {message.merged_count} 条转发消息 ›", self)
         self.footer_label.setObjectName("mergeFooter")
@@ -235,6 +253,10 @@ class MergedCard(QFrame):
 
     def count_text(self) -> str:
         return self.footer_label.text()
+
+    def preview_text(self) -> str:
+        """卡片那一行的原文（富文本时 ``preview_label.text()`` 是 HTML，这里存原串）。"""
+        return self._plain_preview
 
     def mouseReleaseEvent(self, event) -> None:          # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
@@ -390,7 +412,7 @@ class MessageBubble(QFrame):
         """引用块的文案（没有引用就是空串）。"""
         if self.quote is None:
             return ""
-        return f"{self.quote.author_label.text()}：{self.quote.text_label.text()}"
+        return f"{self.quote.author_label.text()}：{self.quote.text()}"
 
     # ---------------------------------------------------------------- 选择
     def is_selected(self) -> bool:
@@ -682,6 +704,7 @@ class ReplyBar(QFrame):
         self.setObjectName("replyBar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._reply = None
+        self._plain_text = ""                    # 待回复那条的原文（见 text()）
 
         self.title_label = QLabel("", self)
         self.title_label.setObjectName("replyTitle")
@@ -718,8 +741,18 @@ class ReplyBar(QFrame):
             self.hide()
             return
         self.title_label.setText(f"回复 {reply.author}")
-        self.text_label.setText(reply.preview)
+        # 回复条也是 QTextDocument 渲染的文本：国旗要换成 <img>（否则只有 "JP" 字母）
+        self._plain_text = reply.preview
+        payload, rich = flag_text.to_display(reply.preview,
+                                             size=flag_text.PREVIEW_IMAGE_SIZE)
+        self.text_label.setText(payload)
+        self.text_label.setTextFormat(Qt.TextFormat.RichText if rich
+                                      else Qt.TextFormat.PlainText)
         self.show()
+
+    def text(self) -> str:
+        """待回复那条的原文（富文本时 ``text_label.text()`` 是 HTML，这里存原串）。"""
+        return self._plain_text
 
     def clear(self) -> None:
         """✕ / 发完消息之后收起（发信号让主窗口把"待回复"也清掉）。"""
@@ -1021,9 +1054,16 @@ class PinBanner(QFrame):
     def _sync(self) -> None:
         message, author, pin = self.current()
         preview = " ".join(getattr(message, "preview_text", "").split()) or "（空消息）"
-        if len(preview) > 42:
-            preview = preview[:41] + "…"
-        self.text_label.setText(f"{author}：{preview}" if author else preview)
+        # 截断走 flag_text.truncate：按字符切很容易切在两字符国旗的中间，
+        # 剩下半面会渲染成一个字母方块
+        preview = flag_text.truncate(preview, 42)
+        line = f"{author}：{preview}" if author else preview
+        # 横幅也是 QTextDocument 渲染的文本：国旗要换成 <img>，不然 Windows 只肯
+        # 画成 "CN" 两个字母（气泡里能显示成图，这里一直漏了）
+        payload, rich = flag_text.to_display(line)
+        self.text_label.setText(payload)
+        self.text_label.setTextFormat(Qt.TextFormat.RichText if rich
+                                      else Qt.TextFormat.PlainText)
         self.scope_label.setText(getattr(pin, "label", ""))     # 仅我可见 / 双方可见
         many = len(self._pins) > 1
         self.counter_label.setText(f"{self._index + 1}/{len(self._pins)}" if many else "")
@@ -1699,6 +1739,15 @@ class ChatView(QWidget):
             self.message_list.refresh_message(message)
         else:
             self.append_message(message)
+
+    def refresh_status(self) -> None:
+        """重画头部第二行（在线状态变化时用：成员的 online 变了，这行要跟着变）。"""
+        conversation = self._conversation
+        if conversation is None:
+            return
+        if self._typing:
+            return                                  # 正在输入…优先，别把它盖掉
+        self.status_label.setText(conversation.subtitle())
 
     def set_typing(self, typing: bool) -> None:
         if self._typing == typing:

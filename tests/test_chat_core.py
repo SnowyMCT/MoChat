@@ -23,7 +23,7 @@ from mchat.core import transport                                       # noqa: E
 from mchat.core.crashlog import (CRASH_LOG_NAME,                          # noqa: E402
                                  default_crash_log_path, install_crash_log)                                    # noqa: E402
 from mchat.core.models import (ChatKind, Conversation, Message, PinRef,   # noqa: E402
-                               User,
+                               User, ellipsize, strip_partial_flag,
                                format_clock, format_day_label,
                                format_list_time, same_day)
 from mchat.core.store import (CONFIRM_PREVIEW, MESSAGE, PIN, READ,        # noqa: E402
@@ -111,6 +111,45 @@ def test_preview_truncated():
     conv.messages.append(_message("c", "很长的消息" * 20, NOW))
     assert conv.preview_text().endswith("…")
     assert len(conv.preview_text()) <= 42
+
+
+def test_truncation_never_splits_a_flag():
+    """截断只能切在整面旗之外 —— 落单的半面旗会被字体画成一个字母方块（像乱码）。
+
+    覆盖三处"取前几十个字"的地方：会话摘要、回复引用快照，以及它们共用的
+    :func:`ellipsize` / :func:`strip_partial_flag`。
+    """
+    flag = "🇯🇵"
+
+    def lone_halves(text: str) -> int:
+        """数文里有几个"半面旗"（成对的 regional indicator 不算）。"""
+        found = 0
+        index = 0
+        while index < len(text):
+            if 0x1F1E6 <= ord(text[index]) <= 0x1F1FF:
+                paired = (index + 1 < len(text)
+                          and 0x1F1E6 <= ord(text[index + 1]) <= 0x1F1FF)
+                found += 0 if paired else 1
+                index += 2 if paired else 1
+            else:
+                index += 1
+        return found
+
+    assert strip_partial_flag("abc" + flag) == "abc" + flag        # 整面旗留着
+    assert strip_partial_flag("abc" + flag[0]) == "abc"            # 半面旗去掉
+    assert strip_partial_flag("abc\u200d") == "abc"                # 尾巴上的零宽连接符
+
+    cut = "x" * 40 + flag[0]
+    assert ellipsize(cut + "尾巴", 42) == "x" * 40 + "…"           # 正好切在半面旗上
+    assert ellipsize("x" * 40 + flag + "尾巴", 42) == "x" * 40 + "…"   # 整面旗也放不下
+
+    # 会话摘要（42 字）与回复引用（42 字）都不能切出半面旗
+    text = "x" * 40 + flag + "尾巴"
+    conv = Conversation("c", "王尼玛", ChatKind.DIRECT, members=[_user("王尼玛", "lin")])
+    conv.messages.append(_message("c", text, NOW))
+    assert conv.preview_text() == "x" * 40 + "…", repr(conv.preview_text())
+    assert lone_halves(store_ref := _store().reply_ref(_message("c-lin", text, NOW)).preview) == 0
+    assert store_ref == "x" * 40 + "…", repr(store_ref)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +418,37 @@ def test_set_pinned_and_muted():
     assert store.set_muted("c2", False) is True
 
 
+def test_set_user_online_flips_frozen_members():
+    """好友上线/下线：``User`` 是 frozen dataclass，改状态只能 replace 出新的。
+
+    这条是 bug 回归：原来 ``_apply_presence`` 写的是 ``member.online = ...``，
+    在 frozen dataclass 上抛 ``FrozenInstanceError``，而它跑在 ``tick()`` 里 ——
+    异常一冒整条事件轮询就断，表现就是"对方上线了，我这边还写着离线"。
+    """
+    lin = _user("王尼玛", "lin", online=False)
+    direct = Conversation("c-lin", "王尼玛", ChatKind.DIRECT, members=[lin])
+    group = Conversation("c-group", "天下尼玛是一家", ChatKind.GROUP,
+                         members=[_user("曹尼玛", "su", online=True), lin])
+    store = ChatStore([direct, group])
+    assert direct.subtitle() == "离线"
+
+    # 一个成员在多处出现（单聊 + 群），一次都要改到
+    assert store.set_user_online("lin", True) == ["c-lin", "c-group"]
+    assert store.get("c-lin").member("lin").online is True
+    assert store.get("c-group").member("lin").online is True
+    assert store.get("c-lin").subtitle() == "在线"          # 聊天头部第二行跟着变
+    assert store.get("c-group").subtitle() == "2 位成员"     # 群聊不显示某人在线
+
+    # 幂等：状态没变就不算"变了"（界面不会白刷一遍）
+    assert store.set_user_online("lin", True) == []
+    # 离线也能翻回去；不认识的人 / 不认识的会话都不炸
+    assert store.set_user_online("lin", False) == ["c-lin", "c-group"]
+    assert store.get("c-lin").member("lin").online is False
+    assert store.set_user_online("ghost", True) == []
+    assert store.set_member_online("不存在的会话", "lin", True) is False
+    assert store.set_member_online("c-lin", "ghost", True) is False
+
+
 def test_total_unread_skips_muted():
     store = ChatStore([_conv("c1", [("一", 1.0, "m1")]), _conv("c2", [("二", 2.0, "m2")])])
     store.set_unread("c1", 2)
@@ -573,9 +643,10 @@ def test_forward_payload_reaches_transport():
 
 def test_crash_log_keeps_evidence():
     """崩溃要留现场：致命信号写栈、未捕获异常写 traceback（都是"窗口突然消失"时唯一的线索）。"""
-    path = os.path.join(tempfile.gettempdir(), "mchat-crash-test.log")
-    if os.path.exists(path):
-        os.remove(path)
+    # 文件名带上进程号：%TEMP% 里那份固定名字的日志是**故意留着不删**的
+    # （faulthandler 抓着句柄），同一个进程里第二次跑到这里删除就会 PermissionError
+    # —— 换唯一名字，测试之间不再互相踩。
+    path = os.path.join(tempfile.gettempdir(), f"mchat-crash-test-{os.getpid()}.log")
     old_hook = sys.excepthook
     try:
         assert install_crash_log(path) == path

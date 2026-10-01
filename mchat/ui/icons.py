@@ -172,6 +172,32 @@ def _double_check(painter: QPainter, color: QColor) -> None:
     painter.drawLine(QPointF(0.58, 0.76), QPointF(0.96, 0.32))
 
 
+def _people(painter: QPainter, color: QColor) -> None:
+    """两个人（前面一个大、后面一个小的头 + 肩）—— 好友入口。
+
+    20px 下双色不好表达，所以靠"前后错位"区分：后面的头小一点、往右上偏，
+    前面的身体盖住它一部分，视觉上就是两个人而不是两个圆圈。
+    """
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(color)
+    _dot(painter, 0.70, 0.28, 0.135)                       # 后面那个人的头
+    behind = QPainterPath()
+    behind.moveTo(0.44, 0.88)
+    behind.lineTo(0.44, 0.76)
+    behind.arcTo(QRectF(0.44, 0.52, 0.52, 0.48), 180.0, -180.0)
+    behind.lineTo(0.96, 0.88)
+    behind.closeSubpath()
+    painter.drawPath(behind)
+    _dot(painter, 0.38, 0.32, 0.185)                       # 前面那个人的头
+    front = QPainterPath()
+    front.moveTo(0.06, 0.90)
+    front.lineTo(0.06, 0.76)
+    front.arcTo(QRectF(0.06, 0.46, 0.64, 0.60), 180.0, -180.0)
+    front.lineTo(0.70, 0.90)
+    front.closeSubpath()
+    painter.drawPath(front)
+
+
 _PAINTERS = {
     "search": _search,
     "send": _send,
@@ -185,6 +211,7 @@ _PAINTERS = {
     "file": _file,
     "image": _image,
     "gear": _gear,
+    "people": _people,
 }
 
 

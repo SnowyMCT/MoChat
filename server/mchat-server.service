@@ -1,0 +1,88 @@
+# MChat 服务端 systemd 单元
+#
+# 安装：
+#   sudo cp mchat-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mchat-server
+#   journalctl -u mchat-server -f          # 看日志
+#   sudo systemctl stop mchat-server       # 优雅停止（发 SIGTERM，服务端会落盘再退出）
+#
+# ★ 需要按你的机器改的行都标了「改这里」，主要就这三处：
+#   1) User= / Group=          —— 跑服务的低权限账号
+#   2) WorkingDirectory= / ExecStart= 的脚本路径 —— 你把 server/ 放哪了
+#   3) Environment=MCHAT_DATA= —— 数据目录（数据库 + 附件），备份就备这个目录
+#   改完记得：sudo mkdir -p <数据目录> && sudo chown -R mchat:mchat <数据目录>
+
+[Unit]
+Description=MChat server（零依赖 HTTP/JSON 聊天后端 + 长轮询推送）
+Documentation=file:///opt/mchat/PROTOCOL.md
+Documentation=file:///opt/mchat/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 改这里 1)：跑服务的账号（建议专用系统账号，不要用 root）
+#   sudo useradd --system --home /var/lib/mchat --shell /usr/sbin/nologin mchat
+User=mchat
+Group=mchat
+
+# 改这里 2)：程序放哪了
+WorkingDirectory=/opt/mchat
+
+# 改这里 3)：数据目录（数据库 mchat.db 和 files/ 附件都在这）
+#   注意 Environment= 里的值不要带引号，也不要带尾随空格
+Environment=MCHAT_DATA=/var/lib/mchat
+Environment=PYTHONUNBUFFERED=1
+
+# 改这里 2) 连带：解释器和脚本路径；参数按需增删
+#   --host 127.0.0.1 表示只给本机（放在 nginx/caddy 反代后面时用这个，更安全）
+#   直接对外服务才写 --host 0.0.0.0（记得同时开防火墙端口）
+#   ★ 注册邀请码默认是"服务端自己生成 + 落库 + 打在日志里"：
+#       journalctl -u mchat-server | grep 邀请码
+#     想固定成自己的码就加 --invite-code=xxx；想彻底关掉注册用 --no-register。
+#   ★ 放在 nginx/caddy 后面时务必加 --trust-proxy（否则每 IP 限流退化成"所有人共用一个桶"）。
+#   ★ 内存：上传是整段读进内存的，--max-connections × --max-upload-mb 就是最坏占用。
+#     1GB 小机器建议 --max-connections 100 --max-upload-mb 16（服务端启动时会自动提醒）。
+ExecStart=/usr/bin/python3 /opt/mchat/mchat_server.py \
+          --host 127.0.0.1 \
+          --port 8765 \
+          --data ${MCHAT_DATA} \
+          --token-ttl-days 30 \
+          --max-upload-mb 32 \
+          --max-connections 150 \
+          --login-rate 12 \
+          --lock-after 5 \
+          --trust-proxy
+#   ★ 想开磁盘加密（消息/附件在磁盘上是密文）就把下面这行放开，并用
+#     sudo systemd-analyze verify / 先确认密钥文件存在（配了却读不到会拒绝启动）：
+#Environment=MCHAT_STORAGE_KEY_FILE=/etc/mchat/storage.key
+
+Restart=always
+RestartSec=2
+# 服务端收到 SIGTERM 会关监听、提交事务、打印一行日志再退出；
+# 下面给它留 20 秒收尾时间（超时才 SIGKILL 硬杀）
+KillSignal=SIGTERM
+TimeoutStopSec=20
+KillMode=mixed
+
+# 资源上限（按机器情况调；聊天服务并发不高，主要是长轮询的连接数）
+LimitNOFILE=8192
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mchat-server
+
+# --- 可选加固：确认上面路径没问题后再取消注释 ---
+# NoNewPrivileges=true
+# PrivateTmp=true
+# ProtectSystem=strict
+# ProtectHome=true
+# ReadWritePaths=/var/lib/mchat          # ← 必须和你上面的数据目录一致，否则写不进去
+# ProtectKernelTunables=true
+# ProtectControlGroups=true
+# RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

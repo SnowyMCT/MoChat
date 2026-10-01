@@ -9,7 +9,7 @@
 ----
 * 查询本身由 SQLite 完成（trigram 倒排索引，实测 2 万条里 13ms）；
 * 输入**防抖 180ms**：打字过程中不查询，停下来才查一次，避免每敲一个字母就查库；
-* 结果最多 60 行，行控件复用同一套样式，不加载任何图片资源。
+* 结果最多 60 行，行控件复用同一套样式；国旗用的是仓库里的本地小图（不联网）。
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel,
 
 from ..core.models import format_list_time
 from . import anim
+from . import flag_text
 from .theme import build_qss
 from .widgets import FloatingLabelInput, SegmentedControl
 
@@ -47,11 +48,17 @@ class ResultRow(QFrame):
         self.title_label.setObjectName("searchTitle")
         self.time_label = QLabel(format_list_time(hit.ts), self)
         self.time_label.setObjectName("searchTime")
-        self.snippet_label = QLabel(hit.snippet.strip() or "（空）", self)
+        self._plain_text = hit.snippet.strip() or "（空）"
+        self.snippet_label = QLabel(self)
         self.snippet_label.setObjectName("searchSnippet")
         self.snippet_label.setSizePolicy(QSizePolicy.Policy.Ignored,
                                          QSizePolicy.Policy.Preferred)
-        self.snippet_label.setTextFormat(Qt.TextFormat.PlainText)
+        # 命中片段也是 QTextDocument 渲染的文本：国旗要换成 <img>（否则只有 "JP" 字母）
+        payload, rich = flag_text.to_display(self._plain_text,
+                                             size=flag_text.PREVIEW_IMAGE_SIZE)
+        self.snippet_label.setText(payload)
+        self.snippet_label.setTextFormat(Qt.TextFormat.RichText if rich
+                                         else Qt.TextFormat.PlainText)
 
         top = QHBoxLayout()
         top.setSpacing(8)

@@ -31,13 +31,16 @@ from typing import Iterable
 from .models import (Attachment, Message, PinRef, merged_from_json,   # noqa: F401
                      merged_to_json, pins_from_json, pins_to_json,
                      reply_from_json, reply_to_json)
+from .atrest import AtRestError, StorageCipher
 
-__all__ = ["ChatLog", "SearchHit", "DEFAULT_LIMIT", "SEARCH_LIMIT", "TRIGRAM_MIN"]
+__all__ = ["ChatLog", "SearchHit", "DEFAULT_LIMIT", "SEARCH_LIMIT", "TRIGRAM_MIN",
+           "SEARCH_SCAN_LIMIT"]
 
 SCHEMA_VERSION = 4
 DEFAULT_LIMIT = 200        # 单个会话一次取多少条（界面只画这么多）
 SEARCH_LIMIT = 60          # 搜索一次最多返回多少条
 TRIGRAM_MIN = 3            # trigram 索引能命中的最短关键词长度
+SEARCH_SCAN_LIMIT = 20000  # 加密模式下"取回来解密再搜"一次最多扫多少条（见 search）
 
 # 表。注意 messages 的三列是 v2 新增的（老库由 _migrate 补上）：
 # * attachment  —— 附件（JSON：path/name/size），没有就是 NULL
@@ -148,10 +151,17 @@ class SearchHit:
 
 
 class ChatLog:
-    """聊天历史库。``path`` 传 ``None`` 或 ``":memory:"`` 就是纯内存（测试/关闭持久化）。"""
+    """聊天历史库。``path`` 传 ``None`` 或 ``":memory:"`` 就是纯内存（测试/关闭持久化）。
 
-    def __init__(self, path: str | None = None):
+    ``cipher`` 给了就把**正文/附件信息/引用/转发/草稿**这些内容列加密后再落盘
+    （见 :mod:`mchat.core.atrest`）。不影响 id、时间戳、会话 id 这些查询要用的列，
+    也不需要改表结构：老库里那些没带 ``enc1:`` 前缀的明文行**照样读得出来**，
+    并且会在打开时被就地重写成密文（:meth:`reencrypt_plaintext`）。
+    """
+
+    def __init__(self, path: str | None = None, *, cipher: StorageCipher | None = None):
         self.path = path or ":memory:"
+        self._cipher = cipher or StorageCipher(None, reason="没有配置静态加密")
         if self.path != ":memory:":
             directory = os.path.dirname(os.path.abspath(self.path))
             if directory:
@@ -161,6 +171,8 @@ class ChatLog:
         if self.path != ":memory:":                       # 内存库没有 WAL 可言
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=NORMAL")
+        # 加密模式下，删除过的页里不该留着旧明文 —— 覆盖写是免费的，直接开
+        self._db.execute("PRAGMA secure_delete=ON")
         self._db.executescript(SCHEMA)
         migrated = self._migrate()                        # 老库（v1）补列 + 打标记
         self._db.executescript(SCHEMA_FTS)
@@ -171,6 +183,69 @@ class ChatLog:
         elif self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._db.commit()
+        if self._cipher.available:
+            # 以前明文存下来的行：打开时顺手重写成密文（一次性、幂等）
+            self.reencrypt_plaintext()
+
+    # ================================================================== 静态加密
+    @property
+    def cipher(self) -> StorageCipher:
+        return self._cipher
+
+    @property
+    def encrypted(self) -> bool:
+        """这份本地库现在是不是加密存的（界面上/自检里要如实说）。"""
+        return self._cipher.available
+
+    def encryption_note(self) -> str:
+        return self._cipher.describe()
+
+    def _seal(self, value):
+        """写库前：文本字段加密（``None``/空串原样）。"""
+        return self._cipher.encrypt_text(value) if self._cipher.available else value
+
+    def _unseal(self, value, what: str = "内容"):
+        """读库后：解密。**解不开也不能让界面炸**，放一句人话进去。"""
+        if not isinstance(value, str) or not value.startswith("enc1:"):
+            return value
+        try:
+            return self._cipher.decrypt_text(value)
+        except AtRestError as exc:
+            return "⚠️%s解密失败（%s）" % (what, exc)
+
+    def _unseal_json(self, value):
+        """结构化字段（附件/引用/转发）解不开就当"没有"，别往界面塞半截数据。"""
+        if not isinstance(value, str) or not value.startswith("enc1:"):
+            return value
+        try:
+            return self._cipher.decrypt_text(value)
+        except AtRestError:
+            return None
+
+    def reencrypt_plaintext(self) -> int:
+        """把库里还留着的**明文行**重写成密文，返回改了多少条。
+
+        第一次给老库打开加密时走这一趟；之后每次打开都跑一遍（代价是几条 SELECT，
+        没有明文行时立即返回）。改完顺手 VACUUM 一次 —— 老明文页不然还留在文件里。
+        """
+        if not self._cipher.available:
+            return 0
+        rows = self._db.execute("SELECT * FROM messages").fetchall()
+        pending = []
+        for row in rows:
+            if self._cipher.is_encrypted_text(row["text"]):
+                continue
+            message = self._message(row)
+            if message is None:
+                continue
+            pending.append(self._row(message))
+        if not pending:
+            return 0
+        with self._db:
+            self._db.executemany(_UPSERT, pending)
+        # 老明文的页现在"逻辑上"没用了，但物理上还在（WAL + freelist）：VACUUM 收干净
+        self.compact()
+        return len(pending)
 
     def _migrate(self) -> bool:
         """把老库升到当前版本，返回**消息表是否被动过**（动了就要重建 FTS 索引）。
@@ -396,10 +471,15 @@ class ChatLog:
         Python 侧不用再切字符串。
 
         检索的是 ``search_text``（正文 + 附件文件名），所以"搜附件名"也能找到消息。
+
+        **加密模式下走另一条路**（:meth:`_search_decrypted`）：索引里存的是密文，
+        FTS 帮不上忙，于是把最近的一批取回来解密再找 —— 见那个方法的说明。
         """
         query = (query or "").strip()
         if not query:
             return []
+        if self._cipher.available:
+            return self._search_decrypted(query, limit=limit, conversation_id=conversation_id)
         if len(query) >= TRIGRAM_MIN:
             scope = " AND m.conversation_id = ?" if conversation_id else ""
             params: list = [self._match_query(query)]
@@ -428,6 +508,44 @@ class ChatLog:
         return [SearchHit(row["conversation_id"], row["id"], row["snip"],
                           row["ts"], bool(row["outgoing"])) for row in rows]
 
+    def _search_decrypted(self, query: str, *, limit: int,
+                          conversation_id: str | None) -> list[SearchHit]:
+        """加密模式下的搜索：取最近的一批回来**解密再找**。
+
+        为什么不给密文建索引、也不留一份明文副本：
+        * 密文索引搜出来的是乱码，等于没搜；
+        * 留明文副本（哪怕只给搜索用）那加密就白做了 —— 明文又躺回磁盘上了。
+
+        所以退一步用"扫描 + 解密 + 子串匹配"：只扫**最近 SEARCH_SCAN_LIMIT 条**
+        （默认 2 万条，单机聊天够用；解密 2 万条是几十毫秒级），命中够了就停 ——
+        库再怎么涨，界面也不会被搜索卡住。
+        """
+        needle = query.lower()
+        scope = " AND conversation_id = ?" if conversation_id else ""
+        params: list = ([conversation_id] if conversation_id else [])
+        params.append(int(SEARCH_SCAN_LIMIT))
+        rows = self._db.execute(
+            "SELECT id, conversation_id, ts, outgoing, text, file_name"
+            f" FROM messages WHERE 1=1{scope} ORDER BY ts DESC LIMIT ?", params).fetchall()
+        hits: list[SearchHit] = []
+        for row in rows:
+            haystack = self._unseal(row["text"], "消息") or ""
+            name = self._unseal(row["file_name"], "附件名") or ""
+            if name:
+                haystack = (haystack + " " + name).strip()
+            position = haystack.lower().find(needle)
+            if position < 0:
+                continue
+            tail = position + len(query) + 48
+            snippet = (("…" if position > 12 else "")
+                       + haystack[max(0, position - 12):tail]
+                       + ("…" if len(haystack) > tail else ""))
+            hits.append(SearchHit(row["conversation_id"], row["id"], snippet,
+                                  float(row["ts"]), bool(row["outgoing"])))
+            if len(hits) >= limit:
+                break
+        return hits
+
     def stats(self) -> dict:
         """给菜单/自检用：条数、会话数、互动数、附件数、文件占用。"""
         size = 0
@@ -444,6 +562,8 @@ class ChatLog:
             "attachments": self._db.execute(
                 "SELECT count(*) FROM messages WHERE attachment IS NOT NULL").fetchone()[0],
             "bytes": size,
+            # 界面上要如实说明"这份本地库到底加没加密"（别让人以为加密了）
+            "encrypted": self.encrypted,
         }
 
     # ================================================================== 互动
@@ -466,6 +586,22 @@ class ChatLog:
                 self._db.execute("DELETE FROM reactions WHERE message_id = ? AND emoji = ?",
                                  (message_id, emoji))
         return self.reactions(message_id)
+
+    def set_reactions(self, message_id: str, counts: dict, mine=()) -> None:
+        """按**服务端**给的结果整体覆盖这条消息的回应（本地那份只是缓存）。
+
+        为什么不是"加一/减一"：两个人同时点同一个表情会算错；服务端是唯一权威，
+        收到它的清单直接覆盖最省事，也天然幂等（自己的回显重复到达不会翻倍）。
+        """
+        mine = set(mine or ())
+        with self._db:
+            self._db.execute("DELETE FROM reactions WHERE message_id = ?", (message_id,))
+            for emoji, count in (counts or {}).items():
+                if int(count) <= 0:
+                    continue
+                self._db.execute(
+                    "INSERT INTO reactions(message_id, emoji, count, mine) VALUES(?, ?, ?, ?)",
+                    (message_id, emoji, int(count), 1 if emoji in mine else 0))
 
     def reactions(self, message_id: str) -> dict[str, int]:
         return {row["emoji"]: row["count"] for row in self._db.execute(
@@ -502,14 +638,14 @@ class ChatLog:
 
     # ================================================================== 草稿
     def set_draft(self, conversation_id: str, text: str) -> None:
-        """存草稿；空文本等于删掉（不留空行在库里）。"""
+        """存草稿；空文本等于删掉（不留空行在库里）。草稿也是内容，一样加密。"""
         with self._db:
             if text.strip():
                 self._db.execute(
                     "INSERT INTO drafts(conversation_id, text, updated) VALUES(?, ?, ?)"
                     " ON CONFLICT(conversation_id) DO UPDATE SET text = excluded.text,"
                     " updated = excluded.updated",
-                    (conversation_id, text, time.time()))
+                    (conversation_id, self._seal(text), time.time()))
             else:
                 self._db.execute("DELETE FROM drafts WHERE conversation_id = ?",
                                  (conversation_id,))
@@ -517,11 +653,12 @@ class ChatLog:
     def draft(self, conversation_id: str) -> str:
         row = self._db.execute("SELECT text FROM drafts WHERE conversation_id = ?",
                                (conversation_id,)).fetchone()
-        return row["text"] if row else ""
+        return self._unseal(row["text"], "草稿") if row else ""
 
     def drafts(self) -> dict[str, str]:
-        return {row["conversation_id"]: row["text"] for row in self._db.execute(
-            "SELECT conversation_id, text FROM drafts").fetchall()}
+        return {row["conversation_id"]: self._unseal(row["text"], "草稿")
+                for row in self._db.execute(
+                    "SELECT conversation_id, text FROM drafts").fetchall()}
 
     # ================================================================== 内部
     @staticmethod
@@ -529,25 +666,27 @@ class ChatLog:
         """FTS5 查询串：整体当短语（trigram 下即"子串"），引号要转义。"""
         return '"' + query.replace('"', '""') + '"'
 
-    @staticmethod
-    def _row(message: Message) -> tuple:
+    def _row(self, message: Message) -> tuple:
+        """一条消息 -> 落库那一行元组。**内容列在这里统一加密。**"""
         attachment = message.attachment
-        return (message.id, message.conversation_id, message.sender_id, message.text,
+        return (message.id, message.conversation_id, message.sender_id,
+                self._seal(message.text),
                 float(message.ts), int(bool(message.outgoing)), message.status,
-                attachment.dump() if attachment is not None else None,
-                attachment.name if attachment is not None else "",
-                reply_to_json(message.reply_to), message.forwarded_from,
-                merged_to_json(message.merged_items))
+                self._seal(attachment.dump() if attachment is not None else None),
+                self._seal(attachment.name if attachment is not None else ""),
+                self._seal(reply_to_json(message.reply_to)), self._seal(message.forwarded_from),
+                self._seal(merged_to_json(message.merged_items)))
 
-    @staticmethod
-    def _message(row: sqlite3.Row) -> Message:
+    def _message(self, row: sqlite3.Row) -> Message:
+        """库里那一行 -> 一条消息。**内容列在这里统一解密。**"""
         return Message(id=row["id"], conversation_id=row["conversation_id"],
-                       sender_id=row["sender_id"], text=row["text"], ts=row["ts"],
-                       outgoing=bool(row["outgoing"]), status=row["status"],
-                       attachment=_attachment(row["attachment"]),
-                       reply_to=reply_from_json(row["reply_to"]),
-                       forwarded_from=row["forwarded_from"],
-                       merged_items=merged_from_json(row["merged"]))
+                       sender_id=row["sender_id"],
+                       text=self._unseal(row["text"], "消息"),
+                       ts=row["ts"], outgoing=bool(row["outgoing"]), status=row["status"],
+                       attachment=_attachment(self._unseal_json(row["attachment"])),
+                       reply_to=reply_from_json(self._unseal_json(row["reply_to"])),
+                       forwarded_from=self._unseal(row["forwarded_from"], "转发信息") or "",
+                       merged_items=merged_from_json(self._unseal_json(row["merged"])))
 
 
 def _attachment(raw) -> Attachment | None:

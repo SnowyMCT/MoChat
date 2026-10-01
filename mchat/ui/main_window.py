@@ -26,12 +26,20 @@ from PyQt6.QtGui import (QColor, QDesktopServices, QGuiApplication, QKeySequence
                          QPalette, QShortcut)
 from PyQt6.QtWidgets import QHBoxLayout, QMenu, QWidget
 
-from ..core.api import ApiError, NetworkError
+from ..core.api import (ApiError, NetworkError, friend_requests_from_json,
+                        friends_from_json)
+from ..core.atrest import (AtRestError, active_cipher, materialize,
+                           seal_file_in_place)
 from ..core.db import DEFAULT_LIMIT, ChatLog
-from ..core.models import ME_ID, Attachment, ChatKind, Conversation, Message, User
-from ..core.store import MESSAGE, PIN, RESET, ChatStore, StoreEvent
-from ..core.transport import (EVENT_CONVERSATION, EVENT_MESSAGE, EVENT_READ,
-                              EVENT_RESYNC, EVENT_TYPING, LocalTransport,
+from ..core.models import (ME_ID, Attachment, ChatKind, Conversation, Message, PinRef,
+                          User)
+from ..core.paths import resolve_attachment_path
+from ..core.store import FRIENDS, MESSAGE, PIN, RESET, ChatStore, StoreEvent
+from ..core.transport import (EVENT_CONVERSATION, EVENT_FRIEND_REQUEST,
+                              EVENT_MESSAGE, EVENT_PIN, EVENT_PRESENCE,
+                              EVENT_REACTION, EVENT_READ, EVENT_RESYNC,
+                              EVENT_SEND_BLOCKED, EVENT_TYPING,
+                              FRIEND_EVENT_KINDS, LocalTransport,
                               NullTransport, Outgoing)
 from ..core.net_transport import NetworkTransport
 from ..core.session import Session
@@ -41,7 +49,9 @@ from . import anim
 from .async_call import AsyncCall
 from .forward_dialog import ForwardDialog
 from .forward_view import MergedViewerDialog
+from .friends_dialog import BLOCKED_NOTICE, FriendsDialog
 from .new_chat_dialog import NewChatDialog
+from .notify import Notifier
 from .pin_dialog import ask_pin as ask_pin_dialog
 from .search_dialog import SearchDialog
 from .security_tool import SecurityToolDialog
@@ -86,12 +96,15 @@ class MainWindow(QWidget):
     """
 
     logoutRequested = pyqtSignal()          # 侧栏底部「退出登录」→ 启动器负责换窗口
+    closed = pyqtSignal()                   # 用户点 ✕ 把窗口关了 → 启动器负责退出程序
 
     def __init__(self, parent: QWidget | None = None, *, demo=None,
                  transport=None, settings=None, log=None, confirm=None,
                  filedialog=None, ask_pin=None, clipboard=None,
                  session: Session | None = None, api=None):
         super().__init__(parent)
+        # 收尾闸门：**放在最前面**（构造中途也可能派发事件，收尾/回调里都会读它）
+        self._shutdown_done = False
         self.setObjectName("root")
         name = session.name if session is not None else ""
         self.setWindowTitle(f"MChat — {name}" if name else "MChat")
@@ -116,7 +129,8 @@ class MainWindow(QWidget):
                             online=True)
             self._default_chat_id = ""
         # 本地历史库可以注入（测试用临时文件/内存库，绝不碰用户的真实数据）
-        self._log = log if log is not None else ChatLog(default_log_path())
+        self._log = log if log is not None else ChatLog(default_log_path(),
+                                                        cipher=active_cipher())
         self._log.compact()                       # 启动整理一次：WAL 收回主库，文件更小
         # 传输层：注入 > 演示脚本 > 真联网 > 空实现（没登录也不会崩）
         if transport is not None:
@@ -125,7 +139,8 @@ class MainWindow(QWidget):
             self._transport = LocalTransport(demo.scripts)
         elif api is not None:
             self._transport = NetworkTransport(api, me_id=self._user_id,
-                                               download_dir=self.attachment_dir())
+                                               download_dir=self.attachment_dir(),
+                                               auto_download_max=self._auto_download_max())
         else:
             self._transport = NullTransport()
         self._transport.start()
@@ -137,6 +152,14 @@ class MainWindow(QWidget):
         self._forward_dialog: ForwardDialog | None = None
         self._merged_viewer: MergedViewerDialog | None = None
         self._new_chat_dialog: NewChatDialog | None = None
+        self._friends_dialog: FriendsDialog | None = None
+        # 桌面通知 + 提示音：构造**永不失败**（无托盘/无音频后端时内部静默降级），
+        # 测试环境（offscreen 无托盘）自然什么都不弹。开关从设置里读，默认都开。
+        self._notifier = Notifier(icon=None)
+        self._notify_enabled = self._saved_notify()
+        self._sound_enabled = self._saved_sound()
+        self._notifier.set_enabled(self._notify_enabled)
+        self._notifier.set_sound_enabled(self._sound_enabled)
         # 各会话"还没发出去的附件/待回复的那条"（和草稿一样按会话存，切换会话不会串台）
         self._pending_attachments: dict[str, Attachment] = {}
         self._pending_replies: dict[str, object] = {}
@@ -145,10 +168,20 @@ class MainWindow(QWidget):
         self._load_call = AsyncCall(self)          # 拉会话列表
         self._history_call = AsyncCall(self)       # 拉某个会话的历史
         self._action_call = AsyncCall(self)        # 已读回执 / 正在输入 / 下载附件
+        self._pin_call = AsyncCall(self)           # 会话内置顶同步（专用：不能被别人挡住）
+        self._read_call = AsyncCall(self)          # 已读回执（专用：漏一条对方就少一个双勾）
+        self._react_call = AsyncCall(self)         # 表情回应同步（专用）
+        self._friends_call = AsyncCall(self)       # 拉好友 / 申请（GET /api/friends）
         self._load_call.finished.connect(self._on_conversations_loaded)
         self._history_call.finished.connect(self._on_history_loaded)
         self._action_call.finished.connect(self._on_action_done)
-        for call in (self._load_call, self._history_call, self._action_call):
+        self._pin_call.finished.connect(self._on_pin_sent)
+        self._read_call.finished.connect(self._on_read_sent)
+        self._react_call.finished.connect(self._on_reaction_sent)
+        self._friends_call.finished.connect(self._on_friends_loaded)
+        for call in (self._load_call, self._history_call, self._action_call,
+                     self._pin_call, self._read_call, self._react_call,
+                     self._friends_call):
             call.failed.connect(self._on_net_error)
         self._history_wanted = ""                  # 正在等历史回来的会话
         self._typing_sent_at = 0.0                 # "正在输入"的节流时间戳
@@ -156,6 +189,10 @@ class MainWindow(QWidget):
         self._history_loaded: set[str] = set()      # 已经从服务端拉过历史的会话
         self._auth_notified = False                 # "登录失效"只提示一次
         self._typing_until: dict[str, float] = {}    # 对面"正在输入…"的过期时间
+        self._pending_pins: dict[tuple, bool] = {}    # 还没同步给服务端的"双方置顶"
+        self._pending_reads: dict[str, float] = {}    # 还没告诉服务端的"我看到哪了"
+        self._pending_reactions: dict[tuple, bool] = {}   # 还没同步出去的表情回应
+
         # 危险操作的确认弹窗也可以注入（测试里不弹窗、走固定答案）
         self.ask_pin = ask_pin or ask_pin_dialog
         # 剪贴板也是可注入的：测试里换成假实现，免得跑一次测试就把用户
@@ -251,10 +288,12 @@ class MainWindow(QWidget):
         self.chat_view.replyCleared.connect(self._on_reply_cleared)
         self.sidebar.settingsRequested.connect(self.open_settings)
         self.sidebar.newChatRequested.connect(self.open_new_chat)
+        self.sidebar.friendsRequested.connect(self.open_friends)
         self.sidebar.logoutRequested.connect(self.logout)
         self.sidebar.conversationMenuRequested.connect(self._show_conversation_menu)
         self._store.subscribe(self._on_store_event)
         self.sidebar.refresh()
+        self.sidebar.refresh_friends_badge()
 
     def _install_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+T"), self, activated=self.open_tool)
@@ -323,6 +362,19 @@ class MainWindow(QWidget):
                   if path and path != ":memory:" else tempfile.gettempdir())
         return os.path.join(folder, ATTACHMENT_DIRNAME)
 
+    def _auto_download_max(self) -> int:
+        """多大以下的附件才自动下载（字节；0 = 多大都自动下）。
+
+        默认 16MB。这个开关是**防着对面**的：以前来者不拒地全自动下，对端随便发几个
+        大文件就能把磁盘和带宽吃掉；现在超过这个大小的只显示"点一下再下"。
+        想调就在设置里写 ``auto_download_mb``（QSettings，没做界面 —— 属于少数人才改的项）。
+        """
+        raw = self._settings.value("auto_download_mb", 16)
+        try:
+            return max(0, int(float(raw) * 1024 * 1024))
+        except (TypeError, ValueError):
+            return 16 * 1024 * 1024
+
     def load_conversations(self) -> bool:
         """去服务端要会话列表（开窗口、登录后、以及服务端说"重新同步"时调）。"""
         if self._api is None:
@@ -336,6 +388,8 @@ class MainWindow(QWidget):
         return True
 
     def _on_conversations_loaded(self, payload) -> None:
+        if self._shutdown_done:
+            return          # 窗口已经关了、库也关了：迟到的后台结果别再往库里写
         self._apply_conversations((payload or {}).get("items") or [])
 
     def _apply_conversations(self, items) -> int:
@@ -361,7 +415,6 @@ class MainWindow(QWidget):
                 # 上次退出前的历史先在本地捞回来（离线也能看），再由服务端补新的
                 self._store.hydrate(conversation_id,
                                     self._log.load(conversation_id, limit=DEFAULT_LIMIT))
-                conversation.pins = pins.get(conversation_id, ())
                 added += 1
             else:
                 existing.title = conversation.title
@@ -370,8 +423,11 @@ class MainWindow(QWidget):
                 existing.pinned = conversation.pinned
                 existing.muted = conversation.muted
                 if conversation.messages:
+                    self._persist_reactions(conversation.messages)
                     self._store.hydrate(conversation_id, conversation.messages)
                 self._store.set_unread(conversation_id, unread)
+            # 置顶要合一份：服务端知道"双方可见"的那些，本地知道"仅我可见"的那些
+            self._merge_pins(conversation, pins.get(conversation_id, ()))
             if cleared.get(conversation_id) and unread:
                 # 本地清空过这个会话，但服务端还记着未读：把旧的未读顺手抹掉
                 self._sync_read_to_server(conversation_id)
@@ -380,6 +436,28 @@ class MainWindow(QWidget):
         if self._current_id == "" and added:
             self.select_conversation(self._store.conversations()[0].id)
         return added
+
+    def _merge_pins(self, conversation, local_pins) -> tuple:
+        """合成这个会话的置顶列表：**服务的"双方可见" + 本地的"仅我可见"**。
+
+        为什么必须合：`pins` 在两边各有一半 ——
+        * 服务端（``Conversation.pins``）只下发"双方可见"的那些，而且它是**权威**：
+          对方取消了我这边也要跟着消失，所以不能只信本地库；
+        * "仅我可见"服务端压根不知道（那是刻意不发请求的），只能从本地库来。
+
+        按 message_id 去重、双方可见的优先；合完把结果写回本地库，
+        这样离线打开也能看到上次那份（含对方置顶的那些）。
+        """
+        shared = tuple(conversation.pins)                    # 服务端下发，都是双方可见
+        mine = tuple(pin for pin in (local_pins or ()) if not pin.for_both)
+        known = {pin.message_id for pin in shared}
+        merged = shared + tuple(pin for pin in mine if pin.message_id not in known)
+        conversation.pins = merged
+        if merged != tuple(local_pins or ()):
+            self._log.set_pinned_refs(conversation.id, merged)
+        if conversation.id == self._current_id:
+            self._sync_pin_banner()
+        return merged
 
     def _ensure_history(self, conversation_id: str) -> bool:
         """打开会话时补历史：界面里只有最近几十条，更早的要向服务端要。"""
@@ -400,6 +478,8 @@ class MainWindow(QWidget):
     def _on_history_loaded(self, payload) -> None:
         from ..core.api import messages_from_json
 
+        if self._shutdown_done:
+            return          # 同上：库已关，迟到的历史回填直接丢掉
         payload = dict(payload or {})
         conversation_id = str(payload.get("cid") or "")
         messages = messages_from_json(payload.get("messages"), me_id=self._user_id)
@@ -408,6 +488,7 @@ class MainWindow(QWidget):
         if messages:
             for message in messages:
                 self._log.save_message(message)     # 服务端历史也落本地：离线能翻
+            self._persist_reactions(messages)        # 别人点过的表情也要落本地
             self._store.hydrate(conversation_id, messages)
         self._history_loaded.add(conversation_id)
         if conversation_id == self._current_id:
@@ -429,12 +510,52 @@ class MainWindow(QWidget):
         if self._server_read_at.get(conversation_id, 0.0) >= stamp:
             return
         self._server_read_at[conversation_id] = stamp
+        self._pending_reads[conversation_id] = max(
+            stamp, self._pending_reads.get(conversation_id, 0.0))
+        self._flush_reads()
+
+    def _persist_reactions(self, messages) -> None:
+        """把服务端给的消息回应写进本地缓存（下次离线打开也能看到别人点过的表情）。
+
+        服务端给的清单（哪怕是空的）才是权威：所以本地"刚点的那一下"最终会被
+        服务端的回显覆盖成它算出来的数字 —— 两个人同时点也不会算重。
+        """
+        for message in messages or ():
+            reactions = getattr(message, "reactions", None)
+            if reactions is None:
+                continue
+            self._log.set_reactions(
+                message.id,
+                {item.emoji: item.count for item in reactions},
+                {item.emoji for item in reactions if item.mine},
+            )
+
+    def _flush_reads(self) -> bool:
+        """把"我看到哪了"发给服务端；通道忙就等下一次（tick 会再叫它）。
+
+        为什么要排队：之前共用 ``_action_call``，它同时在跑别的活时 ``run()`` 直接返回
+        False —— 已读回执就被静默吞掉了，对方永远等不到双勾。
+        """
+        api = self._api
+        if api is None or self._read_call.is_running() or not self._pending_reads:
+            return False
+        conversation_id = next(iter(self._pending_reads))
+        stamp = self._pending_reads[conversation_id]
 
         def work():
-            self._api.mark_read(conversation_id, stamp)
-            return {"kind": "read", "cid": conversation_id}
+            api.mark_read(conversation_id, stamp)
+            return {"kind": "read", "cid": conversation_id, "ts": stamp}
 
-        self._action_call.run(work)
+        return self._read_call.run(work)
+
+    def _on_read_sent(self, payload) -> None:
+        payload = dict(payload or {})
+        if payload.get("kind") != "read":
+            return
+        conversation_id = payload.get("cid")
+        if self._pending_reads.get(conversation_id) == payload.get("ts"):
+            self._pending_reads.pop(conversation_id, None)
+        self._flush_reads()
 
     def notify_typing(self) -> None:
         """"我正在输入" —— 3 秒一次就够（每敲一个字都发会把服务器淹掉）。
@@ -465,6 +586,8 @@ class MainWindow(QWidget):
         payload = dict(payload or {})
         if payload.get("kind") != "download":
             return
+        if self._shutdown_done:
+            return          # 关窗之后才下完的附件：库已经关了，别写（下次打开重下）
         message_id = str(payload.get("message_id") or "")
         path = str(payload.get("path") or "")
         message = self._store.message(message_id)
@@ -496,11 +619,11 @@ class MainWindow(QWidget):
             return False
         dest = (transport.cache_path(attachment)
                 if hasattr(transport, "cache_path")
-                else os.path.join(self.attachment_dir(),
-                                  f"{attachment.remote_id}-{attachment.name}"))
+                else resolve_attachment_path(self.attachment_dir(),
+                                             attachment.remote_id, attachment.name))
 
         def work():
-            api.download(attachment.remote_id, dest)
+            api.download(attachment.remote_id, dest, root=self.attachment_dir())
             return {"kind": "download", "message_id": message_id, "path": dest,
                     "open": open_after}
 
@@ -516,6 +639,14 @@ class MainWindow(QWidget):
                 self._auth_notified = True
                 self.toast.show_message("登录已失效，请重新登录", "warning", 2600)
                 self.logoutRequested.emit()
+                return
+            if self._pending_pins:
+                # 服务端明确说"不行"（比如那条消息已经被删了）：别再排队重试了，
+                # 否则每次 tick 都会拿同一条去撞墙
+                dropped = next(iter(self._pending_pins))
+                self._pending_pins.pop(dropped, None)
+                self.toast.show_message(f"置顶没同步成功：{error.friendly}", "warning", 2400)
+                self._flush_pins()
             return
         if isinstance(error, NetworkError):
             self._sync_connection_hint()
@@ -651,11 +782,73 @@ class MainWindow(QWidget):
     # 表情回应（"点一下加、再点撤"，落在本地库里）
     # ======================================================================
     def toggle_reaction(self, message_id: str, emoji: str) -> dict[str, int]:
+        """点一下加、再点撤。本地先动（界面零延迟），同时把这次变化同步给服务端，
+        由它算总数再推给所有人（含自己的其它设备）—— 计数绝不在客户端自己加减。
+
+        **仅本机演示模式**（没有 api）没有服务端，就退回"纯本地计数"那套。
+        """
         counts = self._log.toggle_reaction(message_id, emoji)
+        mine = self._log.mine(message_id)
         bubble = self.chat_view.message_list.bubbles().get(message_id)
         if bubble is not None:
-            bubble.set_reactions(counts, self._log.mine(message_id))
+            bubble.set_reactions(counts, mine)
+        message = self._store.message(message_id)
+        if message is not None and self._api is not None:
+            self._react_on_server(message.conversation_id, message_id, emoji,
+                                  emoji in mine)
         return counts
+
+    def _react_on_server(self, conversation_id: str, message_id: str, emoji: str,
+                         added: bool) -> bool:
+        """把这次回应同步给服务端；连不上就排队，等连上自动补（见 tick）。"""
+        if self._api is None:
+            return False
+        self._pending_reactions[(conversation_id, message_id, emoji)] = bool(added)
+        return self._flush_reactions()
+
+    def _flush_reactions(self) -> bool:
+        api = self._api
+        if api is None or self._react_call.is_running() or not self._pending_reactions:
+            return False
+        (conversation_id, message_id, emoji), added = next(iter(self._pending_reactions.items()))
+
+        def work():
+            api.set_reaction(conversation_id, message_id, emoji, added)
+            return {"kind": "reaction", "cid": conversation_id, "mid": message_id,
+                    "emoji": emoji}
+
+        return self._react_call.run(work)
+
+    def _on_reaction_sent(self, payload) -> None:
+        payload = dict(payload or {})
+        if payload.get("kind") != "reaction":
+            return
+        self._pending_reactions.pop(
+            (payload.get("cid"), payload.get("mid"), payload.get("emoji")), None)
+        self._flush_reactions()
+
+    def pending_reactions(self) -> dict:
+        """还没同步出去的回应（测试/自检用）。"""
+        return dict(self._pending_reactions)
+
+    def _apply_reaction(self, event) -> None:
+        """别人（或我的另一台设备）给某条消息加了/撤了表情：按服务端给的清单覆盖本地。"""
+        message = self._store.message(event.message_id)
+        if message is None:
+            return
+        counts = {item.emoji: item.count for item in event.reactions}
+        mine = {item.emoji for item in event.reactions if item.mine}
+        self._log.set_reactions(event.message_id, counts, mine)
+        message.reactions = tuple(event.reactions)
+        if event.conversation_id == self._current_id:
+            bubble = self.chat_view.message_list.bubbles().get(event.message_id)
+            if bubble is not None:
+                bubble.set_reactions(counts, mine)
+        self.sidebar.refresh_item(event.conversation_id)
+        if event.sender_id and event.sender_id != self._user_id:
+            who = event.pinned_by_name or "对方"
+            action = "加了" if event.added else "撤了"
+            self.toast.show_message(f"{who} {action} {event.emoji} 回应", "info", 2000)
 
     def reactions(self, message_id: str) -> dict[str, int]:
         return self._log.reactions(message_id)
@@ -751,6 +944,12 @@ class MainWindow(QWidget):
             return False
         after = self._store.pin_ref(conversation.id, message_id)
         self._log.set_pinned_refs(conversation.id, conversation.pins)
+        # "双方可见"才告诉服务端（它会推给会话里所有人）；"仅我可见"是本机的事，
+        # 服务端根本不该知道 —— 否则对面会看到一条本该只有自己知道的置顶。
+        if after is not None and after.for_both:
+            self._pin_on_server(conversation.id, message_id, True)
+        elif after is None and before is not None and before.for_both:
+            self._pin_on_server(conversation.id, message_id, False)
         self._sync_pin_banner()
         total = len(conversation.pins)
         if after is None:
@@ -772,14 +971,52 @@ class MainWindow(QWidget):
     def unpin_current(self, message_id: str = "") -> bool:
         """取消某一条置顶（横幅上的 ✕ 带的就是当前显示那条的 id）；不传就取消显示的这条。"""
         target = message_id or self.chat_view.pinned_message_id()
-        if not target or not self._store.unpin_message(target):
+        if not target:
+            return False
+        was_shared = bool(self._store.pin_ref(self._current_id, target)
+                          and self._store.pin_ref(self._current_id, target).for_both)
+        if not self._store.unpin_message(target):
             return False
         conversation, _ = self._store.locate(target)
         if conversation is not None:
             self._log.set_pinned_refs(conversation.id, conversation.pins)
+            if was_shared:                     # 取消的是"双方可见"那条：对面也要跟着撤
+                self._pin_on_server(conversation.id, target, False)
         self._sync_pin_banner()
         self.toast.show_message("已取消这一条的置顶（其余的留着）", "info", 1800)
         return True
+
+    def _pin_on_server(self, conversation_id: str, message_id: str,
+                       pinned: bool) -> bool:
+        """把"双方置顶"同步给服务端。连不上就**排队**，等连上了自动补（见 tick）。"""
+        if self._api is None:
+            return False
+        self._pending_pins[(conversation_id, message_id)] = bool(pinned)
+        return self._flush_pins()
+
+    def _flush_pins(self) -> bool:
+        """发出一条待同步的置顶（一次一条，成功的回调里再发下一条）。"""
+        api = self._api
+        if api is None or self._pin_call.is_running() or not self._pending_pins:
+            return False
+        (conversation_id, message_id), pinned = next(iter(self._pending_pins.items()))
+
+        def work():
+            api.pin_message(conversation_id, message_id, pinned)
+            return {"kind": "pin", "cid": conversation_id, "mid": message_id}
+
+        return self._pin_call.run(work)
+
+    def _on_pin_sent(self, payload) -> None:
+        payload = dict(payload or {})
+        if payload.get("kind") != "pin":
+            return
+        self._pending_pins.pop((payload.get("cid"), payload.get("mid")), None)
+        self._flush_pins()                     # 队列里还有就接着发
+
+    def pending_pins(self) -> dict:
+        """还没同步出去的置顶（测试/自检用）。"""
+        return dict(self._pending_pins)
 
     def _sync_pin_banner(self) -> None:
         """把当前会话的置顶整串交给横幅（可能多条，每条带"仅我可见 / 双方可见"）。"""
@@ -1177,11 +1414,15 @@ class MainWindow(QWidget):
         self._pending_replies.pop(conversation_id, None)
         self.chat_view.clear_reply()                    # 回复条一起收掉（引用已经进消息了）
         self._store.append(message)
-        self._transport.send(Outgoing(conversation_id, ME_ID, text, message.id,
-                                      attachment=attachment, reply_to=reply))
+        result = self._transport.send(Outgoing(conversation_id, ME_ID, text, message.id,
+                                               attachment=attachment, reply_to=reply))
         self._log.set_draft(conversation_id, "")        # 发出去了，草稿作废
         self._sync_drafts()
         self._typing_sent_at = 0.0                      # 下一句话重新计"正在输入"
+        # 传输层同步回一个"被好友门禁拦下"的结果（联网那层是异步的，走
+        # EVENT_SEND_BLOCKED 事件）。无论哪条路：本地那条标成 blocked，绝不重发。
+        if getattr(result, "intercepted", False):
+            self._apply_blocked(conversation_id, message.id)
         return True
 
     # ======================================================================
@@ -1218,6 +1459,7 @@ class MainWindow(QWidget):
             path = os.path.join(folder, name)
             if not image.save(path, "PNG"):
                 raise OSError("QImage.save 失败")
+            seal_file_in_place(path)             # 贴进来的图也别在磁盘上留明文
         except OSError as error:                 # 权限/磁盘满之类：说清楚而不是静默
             self.toast.show_message(f"这张图片存不下来：{error}", "warning", 2400)
             return None
@@ -1248,7 +1490,7 @@ class MainWindow(QWidget):
                 return False
             return self.download_attachment(message_id, open_after=True)
         if action == "folder":
-            folder = os.path.dirname(os.path.abspath(attachment.path))
+            folder = os.path.dirname(os.path.abspath(materialize(attachment.path)))
             if not os.path.isdir(folder):
                 self.toast.show_message(f"文件夹不见了：{folder}", "warning", 2400)
                 return False
@@ -1258,7 +1500,13 @@ class MainWindow(QWidget):
             self.toast.show_message(f"文件已经不在这个位置了：{attachment.name}",
                                     "warning", 2600)
             return False
-        QDesktopServices.openUrl(QUrl.fromLocalFile(attachment.path))
+        try:
+            # 加密存储的附件要先解出明文才能交给系统程序（解到临时目录，退出时清）
+            plain = materialize(attachment.path)
+        except AtRestError as error:
+            self.toast.show_message(f"这个附件打不开：{error}", "warning", 3200)
+            return False
+        QDesktopServices.openUrl(QUrl.fromLocalFile(plain))
         return True
 
     def pending_attachment(self) -> Attachment | None:
@@ -1286,8 +1534,19 @@ class MainWindow(QWidget):
                     time.time() + TYPING_TTL if event.typing else 0.0)
             elif event.kind == EVENT_READ:
                 self._store.set_read(event.conversation_id, event.message_id)
+            elif event.kind == EVENT_PIN:
+                self._apply_pin(event)
+            elif event.kind == EVENT_REACTION:
+                self._apply_reaction(event)
+            elif event.kind == EVENT_PRESENCE:
+                self._apply_presence(event)
             elif event.kind == EVENT_CONVERSATION:
                 self._apply_new_conversation(event)
+            elif event.kind == EVENT_SEND_BLOCKED:
+                # 我发的消息被好友门禁拦成了申请：本地那条要换个样子，别一直像发出了
+                self._apply_blocked(event.conversation_id, event.message_id)
+            elif event.kind in FRIEND_EVENT_KINDS:
+                self._apply_friend_event(event)
             elif event.kind == EVENT_RESYNC:
                 self.resync()
         # 服务端不认这个令牌了：退回登录界面（启动器负责换窗口）
@@ -1297,6 +1556,14 @@ class MainWindow(QWidget):
             self.toast.show_message(f"{auth_error}，请重新登录", "warning", 3200)
             self.logoutRequested.emit()
         self._expire_typing()
+        # 离线时排队的"双方置顶 / 已读 / 回应"：一联上就补发（服务端都幂等）
+        if getattr(self._transport, "online", False):
+            if self._pending_pins:
+                self._flush_pins()
+            if self._pending_reactions:
+                self._flush_reactions()
+        if self._pending_reads:
+            self._flush_reads()
         self._sync_connection_hint()
         return len(events)
 
@@ -1339,6 +1606,7 @@ class MainWindow(QWidget):
         if message.conversation_id == self._current_id:
             self.chat_view.set_typing(False)
         self._store.receive(message)
+        self._notify_incoming(message)      # 没在看这个会话就弹一条桌面通知
 
     def _apply_new_conversation(self, event) -> None:
         """服务端推来一个新会话（别人拉我开了单聊/进了群）：加进列表并说一声。"""
@@ -1352,6 +1620,73 @@ class MainWindow(QWidget):
         self._store.hydrate(conversation.id,
                             self._log.load(conversation.id, limit=DEFAULT_LIMIT))
         self.toast.show_message(f"新会话：{conversation.title}", "info", 2600)
+
+    def _apply_presence(self, event) -> None:
+        """某人上线/下线了：把他所有会话里的成员状态改掉，并刷新看得见的地方。
+
+        以前只有"重新拉会话列表"才会更新在线状态 —— 对方挂了半小时，我这边小绿点
+        还亮着。现在服务端一变化就推过来，立刻改。
+
+        改状态走 :meth:`~mchat.core.store.ChatStore.set_user_online`（内部用
+        ``replace()`` 换成员对象）：``User`` 是 frozen dataclass，直接给它赋值会抛
+        ``FrozenInstanceError``，而这里跑在 ``tick()`` 里 —— 异常一冒整条事件轮询
+        就断掉，于是"好友上线了还是显示离线"（实测就栽在这行）。
+        """
+        user_id = event.sender_id
+        if not user_id:
+            return
+        touched = self._store.set_user_online(user_id, bool(event.online))
+        if not touched:
+            return
+        for conversation_id in touched:
+            self.sidebar.refresh_item(conversation_id)
+        if self._current_id in touched:
+            conversation = self._store.get(self._current_id)
+            others = [m for m in conversation.members if not m.is_me] if conversation else []
+            self.chat_view.header_avatar.set_online(bool(others and others[0].online))
+            self.chat_view.refresh_status()
+
+    def _apply_pin(self, event) -> None:
+        """对方置顶/取消置顶了一条消息（"双方可见"那种）：跟着变，并且说一声。
+
+        快照消息要并进仓库：对方置顶的那条可能在更早的历史里、我本地还没有 ——
+        只记一个 id 的话横幅画不出来（横幅要显示"谁置顶了哪句话"）。
+        """
+        conversation = self._store.get(event.conversation_id)
+        if conversation is None:
+            return
+        message_id = event.message_id or (event.message.id if event.message else "")
+        if not message_id:
+            return
+        who = event.pinned_by_name or "对方"
+        mine = bool(event.sender_id) and event.sender_id == self._user_id
+        if event.pinned:
+            if event.message is not None and self._store.message(message_id) is None:
+                self._log.save_message(event.message)
+                self._store.hydrate(event.conversation_id, [event.message])
+            # 注意：**不能**直接调 store.pin_message —— 它是个"开关"（同一条再点一次 =
+            # 取消）。服务端会把置顶事件也推回给发起人自己，于是"我自己置顶的"会被这条
+            # 回显又取消掉（实测：置顶横幅 300ms 后就没了）。这里要的是幂等的"确保置顶"。
+            current = self._store.pin_ref(event.conversation_id, message_id)
+            if current is None or not current.for_both:
+                if not self._store.pin_message(message_id, for_both=True):
+                    return
+            self._log.set_pinned_refs(event.conversation_id, conversation.pins)
+            note = (f"已在双方置顶一条消息" if mine
+                    else f"{who} 置顶了一条消息（双方可见）")
+        else:
+            if not self._store.unpin_message(message_id):
+                return
+            self._log.set_pinned_refs(event.conversation_id, conversation.pins)
+            note = ("已取消这条置顶（对方那边也撤了）" if mine
+                    else f"{who} 取消了一条置顶")
+        if event.conversation_id == self._current_id:
+            self._sync_pin_banner()
+        self.sidebar.refresh_item(event.conversation_id)
+        if not mine:
+            # 自己发起的那条不用再弹一次：点下去的时候已经提示过"已置顶（双方可见）"了，
+            # 服务端把事件推回来只是为了让多设备同步，不该在同一个屏幕上再说一遍
+            self.toast.show_message(note, "info", 2200)
 
     def resync(self) -> bool:
         """重新对一次账：会话列表 + 当前会话的历史。
@@ -1373,13 +1708,22 @@ class MainWindow(QWidget):
             self._sync_pin_banner()                     # 置顶变了：横幅跟着刷
             self.sidebar.refresh_item(event.conversation_id)
             return
+        if event.kind == FRIENDS:
+            # 好友 / 申请变了：侧栏那个申请角标要立刻跟上，开着的好友窗口也要重画
+            self.sidebar.refresh_friends_badge()
+            if self._friends_dialog is not None:
+                self._friends_dialog.refresh()
+            return
         if event.kind == MESSAGE and event.message is not None:
             message = event.message
             self._log.save_message(message)             # 写穿：幂等 upsert，一条一条也不慢
+            self._persist_reactions([message])
             self.chat_view.sync_message(message)
-            # 正开着的会话不留未读
+            # 正开着的会话不留未读 —— 而且**要立刻告诉服务端**：
+            # 只标本地的话，对方那边要等我切走再切回来才看到双勾
             if message.conversation_id == self._current_id and not message.outgoing:
                 self._store.mark_read(message.conversation_id)
+                self._sync_read_to_server(message.conversation_id, message.ts)
         self.sidebar.refresh_item(event.conversation_id)
 
     # ======================================================================
@@ -1414,11 +1758,15 @@ class MainWindow(QWidget):
             dialog.themeChanged.connect(self.set_theme)
             dialog.fontScaleChanged.connect(self.set_text_scale)
             dialog.animationsToggled.connect(self.set_animations)
+            dialog.notifyToggled.connect(self.set_notifications)
+            dialog.soundToggled.connect(self.set_sound_enabled)
             dialog.openDataDirRequested.connect(self.open_data_dir)
             self._settings_dialog = dialog
         dialog = self._settings_dialog
         dialog.sync(theme_name=self.theme_name(), font_scale=self.text_scale(),
                     animations=self.animations_enabled(), stats=self._log.stats(),
+                    notifications=self.notifications_enabled(),
+                    sound=self.sound_enabled(),
                     data_path=self._log.path, transport=self._transport.name)
         dialog.apply_palette(self.current_palette())
         dialog.show()
@@ -1431,12 +1779,171 @@ class MainWindow(QWidget):
 
     def _sync_settings_dialog(self, *, theme_name: str | None = None,
                               font_scale: float | None = None,
-                              animations: bool | None = None) -> None:
+                              animations: bool | None = None,
+                              notifications: bool | None = None,
+                              sound: bool | None = None) -> None:
         """别处（菜单/侧栏）改了设置时，把设置窗口里的控件同步过去（不回抛信号）。"""
         if self._settings_dialog is None:
             return
         self._settings_dialog.sync(theme_name=theme_name, font_scale=font_scale,
-                                   animations=animations)
+                                   animations=animations,
+                                   notifications=notifications, sound=sound)
+
+    # ======================================================================
+    # 桌面通知 / 提示音
+    # ======================================================================
+    def _saved_notify(self) -> bool:
+        """桌面通知开关（默认开；关掉后不再弹系统通知）。"""
+        return str(self._settings.value("notify", "true")).lower() != "false"
+
+    def _saved_sound(self) -> bool:
+        """提示音开关（默认开）。"""
+        return str(self._settings.value("notify_sound", "true")).lower() != "false"
+
+    def notifications_enabled(self) -> bool:
+        return self._notify_enabled
+
+    def sound_enabled(self) -> bool:
+        return self._sound_enabled
+
+    def notifier(self) -> Notifier:
+        """桌面包（测试里替换 ``message`` 记录调用）。"""
+        return self._notifier
+
+    def set_notifications(self, enabled: bool) -> None:
+        """开/关桌面通知（设置里的那个开关，选择会记住）。"""
+        self._notify_enabled = bool(enabled)
+        self._settings.setValue("notify", "true" if enabled else "false")
+        self._notifier.set_enabled(self._notify_enabled)
+        self._sync_settings_dialog(notifications=self._notify_enabled)
+        self.toast.show_message("桌面通知已开启" if enabled else "桌面通知已关闭",
+                                "info", 1500)
+
+    def set_sound_enabled(self, enabled: bool) -> None:
+        """开/关提示音（桌面通知关掉时它不再响；这里管的是单独那一个开关）。"""
+        self._sound_enabled = bool(enabled)
+        self._settings.setValue("notify_sound", "true" if enabled else "false")
+        self._notifier.set_sound_enabled(self._sound_enabled)
+        self._sync_settings_dialog(sound=self._sound_enabled)
+        self.toast.show_message("提示音已开启" if enabled else "提示音已关闭",
+                                "info", 1500)
+
+    def _sender_name(self, message) -> str:
+        """这条消息是谁发的（群聊里是发言人，单聊里就是对方）。"""
+        conversation = self._store.get(message.conversation_id)
+        if conversation is None:
+            return ""
+        for member in conversation.members:
+            if member.id == message.sender_id:
+                return member.name
+        others = [m for m in conversation.members if not m.is_me]
+        return others[0].name if others else ""
+
+    def _notify_incoming(self, message) -> None:
+        """收到别人消息且我没在看那个会话 → 弹桌面通知（+ 提示音）。
+
+        三道必须守住的线：
+        * **自己发的绝不通知自己**（多设备回显也会走这里，先按 outgoing 排掉）；
+        * 窗口是活的、看的又正是这个会话 —— 用户就在看，不用再打扰；
+        * 整段包在 try/except 里：通知坏掉了也绝不能把\"收消息\"带崩。
+        """
+        if not self._notify_enabled or self._notifier is None:
+            return
+        if message.outgoing:
+            return
+        conversation_id = message.conversation_id
+        if conversation_id == self._current_id and self.isActiveWindow():
+            return
+        conversation = self._store.get(conversation_id)
+        title = conversation.title if conversation is not None else "新消息"
+        sender = self._sender_name(message)
+        if sender and sender != title:
+            title = sender
+        body = (message.text or "").strip()
+        if message.attachment is not None:
+            extra = f"[{message.attachment.name}]"
+            body = f"{body} {extra}".strip() if body else extra
+        if not body:
+            body = "发来一条新消息"
+        try:
+            self._notifier.message(title, body)
+        except Exception:                            # noqa: BLE001 —— 通知不许影响收消息
+            pass
+
+    def _apply_blocked(self, conversation_id: str, message_id: str) -> None:
+        """消息被好友门禁拦成申请：本地那条标成 blocked（**不重发**）并明确提示。"""
+        if conversation_id and message_id:
+            self._store.set_message_status(conversation_id, message_id, "blocked")
+        self.toast.show_message(BLOCKED_NOTICE, "warning", 3200)
+
+    # ======================================================================
+    # 好友 / 申请（服务端权威；界面做完事只让主窗口去对账）
+    # ======================================================================
+    def open_friends(self) -> FriendsDialog:
+        """打开好友窗口（非模态、复用同一个实例）：列表 / 申请 / 搜索加好友。"""
+        if self._friends_dialog is None:
+            dialog = FriendsDialog(self, api=self._api, store=self._store,
+                                   theme_name=self.theme_name())
+            dialog.changed.connect(self._on_friends_changed)
+            self._friends_dialog = dialog
+        dialog = self._friends_dialog
+        dialog.apply_palette(self.current_palette())
+        dialog.refresh()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        return dialog
+
+    def friends_dialog(self) -> FriendsDialog | None:
+        return self._friends_dialog
+
+    def _on_friends_changed(self) -> None:
+        """好友窗口里做完一次操作（加 / 同意 / 拒绝 / 删）：去服务端对一次账。"""
+        self.refresh_friends()
+        self.sidebar.refresh()      # 同意/删好友可能让会话列表跟着变
+
+    def refresh_friends(self) -> bool:
+        """拉一次 ``GET /api/friends`` 落进 store（服务端权威）；没联网就只刷角标。"""
+        if self._api is None:
+            self.sidebar.refresh_friends_badge()
+            return False
+
+        def work():
+            return {"data": self._api.friends()}
+
+        if not self._friends_call.run(work):
+            return False
+        return True
+
+    def _on_friends_loaded(self, payload) -> None:
+        if self._shutdown_done:
+            return
+        data = dict((payload or {}).get("data") or {})
+        self._store.set_friends(
+            friends_from_json(data.get("friends"), me_id=self._user_id),
+            friend_requests_from_json(data.get("incoming"), me_id=self._user_id),
+            friend_requests_from_json(data.get("outgoing"), me_id=self._user_id))
+        self.sidebar.refresh_friends_badge()
+        if self._friends_dialog is not None:
+            self._friends_dialog.refresh()
+
+    def _apply_friend_event(self, event) -> None:
+        """服务端推来的好友事件：能就地改的就改，剩下的拉一次权威清单对账。"""
+        if event.user is not None:
+            self._store.apply_friend_event(event.kind, event.user,
+                                           note=event.note, ts=event.ts)
+        self.sidebar.refresh_friends_badge()
+        if self._friends_dialog is not None:
+            self._friends_dialog.refresh()
+        if event.kind == EVENT_FRIEND_REQUEST:
+            # 服务端也会把这条事件回推给**申请方自己的其它设备**（多设备同步），那种情况下
+            # event.user 就是"我"。要是不排掉，自己发起的申请会在这里弹出一句
+            # "XX 申请加你为好友"（XX 还是自己），既莫名其妙又误导。
+            user = event.user
+            if user is not None and not getattr(user, "is_me", False):
+                self.toast.show_message(f"{user.name} 申请加你为好友", "info", 2600)
+        # 申请方 / 被申请方的事件长得一样，方向只有服务端知道 —— 拉一次让状态变权威
+        self.refresh_friends()
 
     # ======================================================================
     # 主题
@@ -1489,6 +1996,8 @@ class MainWindow(QWidget):
             self._merged_viewer.apply_palette(p)
         if self._new_chat_dialog is not None:
             self._new_chat_dialog.apply_palette(p)
+        if self._friends_dialog is not None:
+            self._friends_dialog.apply_palette(p)
         if overlay is not None:
             self.toast.raise_()             # 提示气泡别被快照盖住
 
@@ -1562,6 +2071,15 @@ class MainWindow(QWidget):
         """侧栏底部那行小字（连着/离线/几条待发 + 账号）。"""
         return self.sidebar.mode_hint.text()
 
+    def transport_status(self) -> dict:
+        """传输层的状态快照（诊断与测试用：在线吗、几条待发、最后一条错误是什么）。
+
+        用例失败时把"最后一条错误"打出来，比"断言为假"有用得多 ——
+        联网这套的很多失败都是"网络层悄悄咽掉了"，光看断言看不出为什么。
+        """
+        status = getattr(self._transport, "status", None)
+        return dict(status()) if callable(status) else {"name": self._transport.name}
+
     def logout(self) -> bool:
         """侧栏底部「退出登录」：二次确认后交给启动器换回登录窗口。
 
@@ -1582,14 +2100,28 @@ class MainWindow(QWidget):
 
         退出登录换窗口时**必须**显式调它（``deleteLater`` 之后不一定还会走到
         ``closeEvent``），否则那条长轮询线程会一直挂着占住服务器连接。
+        也正因为如此，关窗之后再有后台回调回来就不能碰库了（见各 ``_on_*`` 里的
+        ``_shutdown_done`` 判断）—— 库里已经关了，再写就是
+        ``sqlite3.ProgrammingError: Cannot operate on a closed database``。
         """
-        if getattr(self, "_shutdown_done", False):
+        if self._shutdown_done:
             return
         self._shutdown_done = True
         self._poller.stop()
+        # 关窗前把还压在发件箱里的消息尽量送出去（有上限，别让"关窗口"卡住）。
+        # 现在关窗＝整个进程立刻退出，不给发件箱一点时间的话，刚敲完的那句
+        # 就只留在本地库里、永远发不出去（本地演示/离线传输层没有 flush，跳过）。
+        flush = getattr(self._transport, "flush", None)
+        if callable(flush):
+            try:
+                flush(wait=1.5)
+            except Exception:                            # noqa: BLE001 —— 收尾阶段不能再抛
+                pass
         self._transport.stop()
+        self._notifier.stop()                            # 收掉托盘 / 停掉提示音（幂等）
         for dialog in (self._search_dialog, self._settings_dialog, self._forward_dialog,
-                       self._merged_viewer, self._new_chat_dialog):
+                       self._merged_viewer, self._new_chat_dialog,
+                       self._friends_dialog):
             if dialog is not None:
                 dialog.close()
         self._save_draft(self._current_id)               # 关窗前把草稿存住
@@ -1602,6 +2134,11 @@ class MainWindow(QWidget):
     def closeEvent(self, event) -> None:                 # noqa: N802
         self.shutdown()
         super().closeEvent(event)
+        # 收尾**之后**再告诉启动器"用户把窗口关了 → 程序该退了"。
+        # 必须显式发：为了登录窗口/主窗口交替，``quitOnLastWindowClosed`` 是关着的，
+        # 没有这一句事件循环就永远转下去 —— 窗口是没了，进程还挂在资源管理器里。
+        # （「退出登录」那条路走的是 ``logoutRequested`` + ``hide()``，不会走到这里。）
+        self.closed.emit()
 
 
 def main(argv: list[str] | None = None) -> int:

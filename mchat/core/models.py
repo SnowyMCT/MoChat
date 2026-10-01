@@ -14,12 +14,14 @@ from typing import Iterable
 
 __all__ = [
     "ChatKind", "User", "Message", "Conversation", "Attachment", "ME_ID",
-    "ReplyRef", "MergedItem", "PinRef", "reply_to_json", "reply_from_json",
+    "ReplyRef", "MergedItem", "PinRef", "Friend", "FriendRequest",
+    "reply_to_json", "reply_from_json",
     "pins_to_json", "pins_from_json",
     "merged_to_json", "merged_from_json",
     "IMAGE_SUFFIXES", "human_size",
     "format_clock", "format_day_label", "format_list_time",
     "same_day", "day_label_key",
+    "strip_partial_flag", "ellipsize",
 ]
 
 ME_ID = "me"          # 当前用户的固定 id（单机演示没有账号体系）
@@ -81,6 +83,37 @@ def format_list_time(ts: float, now: float | None = None) -> str:
 # 数据层不导入 Qt，也不想为了判断类型去解码整张图。
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".jfif", ".gif", ".bmp",
                             ".webp", ".tif", ".tiff", ".ico"})
+
+
+def strip_partial_flag(text: str) -> str:
+    """去掉结尾**落单的半个旗帜**（按字符/像素截断时的收尾处理）。
+
+    为什么需要它：旗帜是**两个** regional indicator 拼起来的（🇯🇵 = J + P），
+    英格兰/海盗旗那种还带零宽连接符（ZWJ）。按字符数截断、或按像素宽度省略号截断，
+    都可能正好切在中间 —— 剩下那一半在字体里会被画成一个孤立的字母方块（看着像乱码）。
+
+    这里只是**纯文本层面**的收尾（把没配成对的尾巴去掉），和"旗子要不要画成图片"
+    无关 —— 那是界面层 ``ui/flag_text.py`` 的事。
+    """
+    while text and text[-1] == "\u200d":            # 尾巴上挂着的零宽连接符
+        text = text[:-1]
+    run = 0                                         # 结尾这一串 regional indicator 有多长
+    while run < len(text) and 0x1F1E6 <= ord(text[-1 - run]) <= 0x1F1FF:
+        run += 1
+    if run % 2:                                     # 两面旗是成对的：奇数说明落了半面
+        text = text[:-1]
+    return text
+
+
+def ellipsize(text: str, limit: int, *, ellipsis: str = "…") -> str:
+    """按字符数截断（``limit`` 是含省略号的总长），且**不把一面旗帜切成两半**。
+
+    摘要、回复引用、聊天记录卡片都是"取前面几十个字"，直接切片很容易切出半面旗，
+    统一走这里（会话列表按像素省略号截断时也用它收尾，见 ``strip_partial_flag``）。
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return strip_partial_flag(text[:max(0, limit - len(ellipsis))]) + ellipsis
 
 
 def human_size(size: int) -> str:
@@ -381,6 +414,10 @@ class User:
     name: str
     online: bool = False
     is_bot: bool = False
+    # 登录用的 @handle。协议里的 User 一直带着它（username），但客户端模型过去只留了
+    # display_name —— 结果好友窗口拿它去调"同意/删除"时直接 AttributeError。
+    # 放在最后并且有默认值，是为了不动任何按位置构造 User(...) 的老代码。
+    username: str = ""
 
     @property
     def initial(self) -> str:
@@ -398,6 +435,65 @@ class User:
     def is_me(self) -> bool:
         """是不是"我自己"（决定消息靠右、不发未读）。"""
         return self.id == ME_ID
+
+
+@dataclass(frozen=True)
+class Friend:
+    """一个好友：``user`` 是对方，``since`` 是**服务端给的**成为好友的时间。
+
+    ``since`` 一律用服务端下发的值，客户端不自己造时间 —— 两台设备上看到的
+    "什么时候成为好友的"才一致。
+    """
+
+    user: User
+    since: float = 0.0
+
+    @property
+    def user_id(self) -> str:
+        return self.user.id
+
+    @property
+    def name(self) -> str:
+        return self.user.name
+
+
+@dataclass(frozen=True)
+class FriendRequest:
+    """一条待处理的好友申请。
+
+    ``incoming``（别人申请加我）里 ``user`` 是**申请人**；``outgoing``（我申请加别人）
+    里 ``user`` 是**被申请人**。``note`` 是申请留言 —— 被好友门禁拦下来的申请，
+    留言就是那条发不出去的消息正文。
+    """
+
+    user: User
+    note: str = ""
+    ts: float = 0.0
+
+    @property
+    def user_id(self) -> str:
+        return self.user.id
+
+    @property
+    def name(self) -> str:
+        return self.user.name
+
+
+@dataclass
+@dataclass(frozen=True)
+class Reaction:
+    """一条消息上的一个回应（表情）聚合。
+
+    ``count`` 是**服务端算的**总数，``mine`` 是"看的人有没有点"——
+    客户端不自己加一减一，两个人同时点才不会被算错。
+    """
+
+    emoji: str
+    count: int = 1
+    mine: bool = False
+
+    def __str__(self) -> str:
+        return f"{self.emoji}{self.count}"
 
 
 @dataclass
@@ -419,6 +515,7 @@ class Message:
     reply_to: "ReplyRef | None" = None            # 回复：被引用那条的快照
     forwarded_from: str = ""                      # 转发自哪个会话（空 = 不是转发）
     merged_items: tuple[MergedItem, ...] = ()     # 合并转发的内容（非空 = 这是一条合并转发）
+    reactions: tuple[Reaction, ...] = ()          # 回应（表情）：服务端算的计数 + 我点过的
 
     @property
     def time_text(self) -> str:
@@ -429,8 +526,25 @@ class Message:
         return self.status == "read"
 
     @property
+    def blocked(self) -> bool:
+        """这条是不是"撞上好友门禁、没发出去"的那条。
+
+        服务端收到非好友的单聊消息**不落库**，而是把它变成一条好友申请；本地那条
+        乐观显示的消息会停在 ``status="blocked"``，界面上标成"已发送好友申请"，
+        而不是一直挂着"✓"（看着像发出去了）。
+        """
+        return self.status == "blocked"
+
+    @property
     def is_reply(self) -> bool:
         return self.reply_to is not None
+
+    def reaction_counts(self) -> dict:
+        """``{表情: 数量}``（气泡直接要这个形状）。"""
+        return {item.emoji: item.count for item in self.reactions}
+
+    def my_reactions(self) -> set:
+        return {item.emoji for item in self.reactions if item.mine}
 
     @property
     def send_text(self) -> str:
@@ -473,9 +587,7 @@ class Message:
         if not self.merged_items:
             return ""
         text = " ".join(self.merged_line(0).split())
-        if len(text) > limit:
-            text = text[:limit - 1] + "…"
-        return text
+        return ellipsize(text, limit)
 
     @property
     def kind(self) -> str:
@@ -578,7 +690,7 @@ class Conversation:
             text = f"{self.sender_name(last)}: {text}"
         elif last.outgoing:
             text = f"我: {text}"
-        return text if len(text) <= 42 else text[:41] + "…"
+        return ellipsize(text, 42)
 
     def preview_time(self, now: float | None = None) -> str:
         last = self.last_message

@@ -17,6 +17,7 @@ from PyQt6.QtGui import QFontMetrics, QPixmap
 from PyQt6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel, QSizePolicy,
                              QToolButton, QVBoxLayout, QWidget)
 
+from ..core.atrest import AtRestError, materialize
 from ..core.models import Attachment
 from .icons import make_icon
 
@@ -59,7 +60,11 @@ def scaled_preview(path: str, *, max_width: int = IMAGE_MAX_WIDTH,
     cached = _PREVIEW_CACHE.get(key)
     if cached is not None:
         return cached
-    pixmap = QPixmap(path)
+    # 附件缓存是加密落盘的 → 先解出临时明文再交给 Qt 读（没加密时这一步是空操作）
+    try:
+        pixmap = QPixmap(materialize(path))
+    except AtRestError:
+        return None
     if pixmap.isNull() or pixmap.width() <= 0 or pixmap.height() <= 0:
         return None
     scaled = pixmap.scaled(max_width, max_height,

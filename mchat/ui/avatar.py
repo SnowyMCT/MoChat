@@ -53,6 +53,10 @@ class Avatar(QWidget):
     def name(self) -> str:
         return self._name
 
+    def is_online(self) -> bool:
+        """右下角那个小绿点现在亮着吗（测试与调试用：不看像素也能断言在线状态）。"""
+        return bool(self._online)
+
     def apply_palette(self, palette) -> None:
         self._online_color = palette.success
         self.update()

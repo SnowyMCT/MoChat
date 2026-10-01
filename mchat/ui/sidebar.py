@@ -7,7 +7,7 @@ from PyQt6.QtGui import QColor, QFontMetrics, QPainter
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QScrollArea,
                              QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
-from ..core.models import Conversation
+from ..core.models import Conversation, strip_partial_flag
 from ..core.store import ChatStore
 from . import anim
 from .avatar import Avatar
@@ -239,6 +239,10 @@ class ConversationItem(QFrame):
         """未截断的摘要原文（测试与调试用）。"""
         return self._preview_text
 
+    def is_online(self) -> bool:
+        """这一行头像上的小绿点现在亮着吗（在线状态变了就该跟着变）。"""
+        return self.avatar.is_online()
+
     def resizeEvent(self, event) -> None:                # noqa: N802
         super().resizeEvent(event)
         self._elide_preview()
@@ -251,6 +255,8 @@ class ConversationItem(QFrame):
         if self._draft and not text.startswith("草稿："):
             text = f"草稿：{self._draft}"
         elided = metrics.elidedText(text, Qt.TextElideMode.ElideRight, width)
+        # 按像素省略号截断可能正好切在一面国旗中间（剩半面 = 一个字母方块），收个尾
+        elided = strip_partial_flag(elided)
         # 先按纯文本截断（截断只认字符），再把旗帜换成小图
         payload, rich = flag_text.to_display(elided, size=flag_text.PREVIEW_IMAGE_SIZE)
         self.preview_label.setTextFormat(Qt.TextFormat.RichText if rich
@@ -275,6 +281,7 @@ class Sidebar(QWidget):
     toolRequested = pyqtSignal()
     settingsRequested = pyqtSignal()                      # 点齿轮：开设置区域
     newChatRequested = pyqtSignal()                       # 点「＋」：找人聊天 / 建群
+    friendsRequested = pyqtSignal()                       # 点好友图标：好友 / 申请 / 加好友
     logoutRequested = pyqtSignal()                        # 点「退出」：回登录界面
     themeChanged = pyqtSignal(str)
 
@@ -329,6 +336,17 @@ class Sidebar(QWidget):
         self.settings_btn = IconButton("gear", self, tooltip="设置：主题 / 文字大小 / 动效（Ctrl+,）")
         self.settings_btn.clicked.connect(self.settingsRequested)
 
+        # 好友入口：列表 / 待处理申请 / 加好友都在那一个窗口里；申请数挂红点角标
+        self.friends_btn = IconButton("people", self, tooltip="好友：列表 / 申请 / 加好友")
+        self.friends_btn.clicked.connect(self.friendsRequested)
+        self.friends_badge = PopBadge(self)
+        self.friends_badge.setObjectName("badge")
+        self.friends_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.friends_badge.setFixedHeight(20)
+        self.friends_badge.setMinimumWidth(20)
+        self.friends_badge.hide()
+        self._friend_requests_shown = 0
+
         row = QHBoxLayout()
         row.setSpacing(6)
         row.setContentsMargins(2, 0, 0, 0)
@@ -337,6 +355,8 @@ class Sidebar(QWidget):
         row.addStretch(1)
         row.addWidget(self.tool_btn)
         row.addWidget(self.new_chat_btn)
+        row.addWidget(self.friends_btn)
+        row.addWidget(self.friends_badge)
         row.addWidget(self.settings_btn)
         return row
 
@@ -456,6 +476,24 @@ class Sidebar(QWidget):
         else:
             self.total_badge.hide()
 
+    def refresh_friends_badge(self) -> None:
+        """待处理好友申请数 → 好友图标旁的红点角标（0 就藏起来）。
+
+        和 ``refresh_total`` 一个路子：数字只从 store 取（服务端落进去的那一份），
+        数字变多时弹一下，别让人错过一条申请。
+        """
+        count = self._store.friend_request_count()
+        if count > 0:
+            grew = count > self._friend_requests_shown
+            self.friends_badge.setText(str(count) if count < 100 else "99+")
+            self.friends_badge.show()
+            if grew and self._friend_requests_shown:
+                self.friends_badge.pop()       # 首次铺列表不弹，免得太吵
+            self._friend_requests_shown = count
+        else:
+            self.friends_badge.hide()
+            self._friend_requests_shown = 0
+
     def set_drafts(self, drafts: dict[str, str]) -> None:
         """草稿表 ``{会话id: 草稿文本}``（主窗口在切会话时更新）。"""
         self._drafts = dict(drafts)
@@ -497,6 +535,8 @@ class Sidebar(QWidget):
         self.tool_btn.setIcon(make_icon("apps", palette.accent, 16))
         self.settings_btn.set_icon_color(palette.muted)
         self.new_chat_btn.set_icon_color(palette.accent)
+        self.friends_btn.set_icon_color(palette.accent)
+        self.friends_badge.apply_palette(palette)
         self.logout_btn.set_icon_color(palette.muted)
         for item in self._items.values():
             item.apply_palette(palette)

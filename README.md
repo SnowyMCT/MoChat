@@ -1,11 +1,17 @@
 # MChat
 
 一个 Telegram 风格的**联网**桌面聊天软件：有账号系统、有服务端、消息真的从一台电脑
-走到另一台电脑。界面（气泡、表情面板、附件、回复/转发、置顶、搜索、动效）照旧，
-但底下已经不是"脚本自动回复"了。
+走到另一台电脑。界面（气泡、表情面板、附件、回复/转发、置顶、搜索、动效）照旧。
 
 * **账号**：注册 / 登录 / 退出登录；登录信息**缓存在本地**，下次打开直接进主界面
-  （和 Telegram 一样：登一次就够了）。缓存里存的是**令牌**，不存密码。
+  （和 Telegram 一样：登一次就够了）。缓存里存的是**令牌**，不存密码，而且**令牌是加密
+  落盘的**（见下面「加密存储」）。
+  服务端**默认要求注册邀请码**（自动生成并打在启动日志里，客户端注册框填在「邀请码」那一格），
+  登录有频率限制与临时锁定 —— 详见 `server/README.md` 的 §9「安全清单」。
+* **加密存储**：客户端本地数据（聊天历史、附件缓存、令牌）**默认全部加密**，数据密钥由
+  Windows DPAPI 绑定到当前账号（`mchat/core/atrest.py`）；服务端可配 `--storage-key-file`
+  让消息与附件在磁盘上也是密文（令牌一律只存哈希）。**注意这仍不是端到端加密** ——
+  服务端进程要处理消息，所以它能读到明文。
 * **服务端**：`server/` 目录是完整可部署的服务端（**纯 Python 标准库**，零第三方依赖），
   拷到服务器上 `python3 mchat_server.py` 就能跑；部署细节见 `server/README.md`、
   协议见 `server/PROTOCOL.md`。
@@ -125,12 +131,25 @@ uv run main.py
 
 ### 旗帜在消息里也是图片
 
-面板只是入口 —— **发出去的消息、输入框里、会话摘要里的旗帜同样是图片**：
+面板只是入口 —— **凡是"消息文本"出现的地方旗帜都是图片**：
+
+- 气泡正文、输入框、会话摘要（侧栏每一行）；
+- 聊天区顶部的**置顶横幅**、输入栏上方的**回复条**、气泡里的**引用块**；
+- **合并转发**卡片那一行摘要、"查看聊天记录"窗口里逐条正文；
+- **搜索结果**的命中片段。
+
+（转发窗口那种 `QPushButton` 行没法渲染富文本，是唯一的例外。）
+
+实现上只有一条路：`mchat/ui/flag_text.py` 的 `to_display(text) -> (payload, 是不是富文本)`，
+**新增任何"把消息文本塞进 QLabel"的地方都要过它** —— 以前只在气泡和侧栏做了转换，
+于是置顶横幅里一直是 "JP/US" 字母（用户一处一处报出来的）。
 
 - 存储 / 发送 / 搜索**永远用原来的字符**（core 层和传输层完全不知道图片的存在）；
   显示前把字符换成 `<img src="file:///…/flags/048.png">`，从输入框取文本时再按 URL
   反查回字符。所以除了面板用的精灵图，还生成了 `mchat/assets/flags/000.png…` 逐张 PNG
   （Qt 富文本的 `<img>` 只按 URL 取"一个文件"，喂不了精灵图里的一格）。
+- 富文本化之后 `QLabel.text()` 是 HTML —— 需要"原文"的地方（复制、引用跳转、测试断言）
+  都另存一份原串并用访问器取（`bubble.text()` / `quote.text()` / `card.preview_text()`…）。
 - 输入框为此从 `QPlainTextEdit` 换成了 `QTextEdit`（只有 `QTextDocument` 能内嵌图片），
   并用 `setAcceptRichText(False)` 挡住外部粘进来的富文本格式；粘贴文本会走同一条
   "旗帜变图"的路。
@@ -139,6 +158,10 @@ uv run main.py
   换回字符。
 - 只有**含旗帜**的消息才走富文本，其余仍是纯文本 —— 消息里写 `<b>粗</b>` 照样原样显示，
   不会被当标签执行（有回归测试盯着）。
+- **截断不会切出"半面旗"**：旗帜是两个 regional indicator，切在中间剩下半个会被字体画成
+  一个字母方块。`core.models.ellipsize()` / `strip_partial_flag()` 统一收尾（会话摘要 42 字、
+  回复引用快照 42 字、合并转发摘要 32 字、侧栏按像素省略号），UI 侧的 `flag_text.truncate`
+  只是它的代理 —— 实现只有一份。
 
 ### 旗帜素材怎么来的
 
@@ -184,6 +207,19 @@ id、再把 id 随消息发出去"，界面不用改（和传输层是同一个�
 检索**按附件名也能命中**：FTS 索引的那一列是「正文 + 附件文件名」
 （`messages.search_text`，VIRTUAL 生成列，磁盘上不存第二份），所以别人丢进来一个
 「评审材料-v3.pdf」，搜「评审材料」就找得到 —— 见下面的「本地历史」一节。
+
+## 会话内置顶（"仅我可见 / 双方可见"，联网版）
+
+气泡右键 →「置顶」会问一句"要不要也给对方置顶"：
+
+- **仅我可见**（默认）：只有自己这边看得到横幅，**不会**发任何请求 —— 服务端压根不知道；
+- **双方可见**：走服务端（`POST /api/conversations/<id>/pin`），会话里**所有人**立刻收到
+  `pin` 事件并跟着置顶/取消 —— 对方那边横幅会显示"双方可见"，谁置顶的也写在提示里。
+  对方**取消**了同一条，自己这边也会跟着撤（服务端才是"双方可见"的权威）。
+- 一个会话可以置顶**多条**，横幅上用 `‹ ›` 翻；
+- 断网时点的"双方置顶"会**排队**，一联上就自动补发（服务端幂等，重复发也不会出问题）；
+- 对方置顶的那条哪怕在更早的历史里、本地还没拉到，也能正常显示 —— 事件里带了那条的
+  **快照**（`message`），收到就先并进本地。
 
 ## 气泡右键菜单（回复 / 复制 / 置顶 / 转发 / 选择 / 删除）
 
@@ -318,6 +354,8 @@ main.py                     启动入口
 mchat/app.py                入口转出（兼容 from mchat.app import main）
 mchat/core/                 纯逻辑层，零 Qt 依赖
     api.py                  服务端 HTTP 客户端 + 线上 JSON → 模型的转换（唯一知道协议的地方）
+    paths.py                附件落地路径的唯一算法：文件名清洗 + "必须落在下载目录里"（安全边界）
+    atrest.py               静态加密：AES-256-GCM + DPAPI 保护的密钥 + 加密附件的临时解密
     session.py              账号登录态的本地缓存（令牌 / 多账号 / 每个账号一个库文件）
     net_transport.py        真联网的传输层：长轮询收、发件箱发、掉线重发、附件上传下载
     crypto.py               Base64 + AES-256-CBC（原 mchat.crypto）
@@ -328,7 +366,7 @@ mchat/core/                 纯逻辑层，零 Qt 依赖
     transport.py            传输层接口 ChatTransport（+ 本机演示实现与空实现）
 mchat/ui/                   界面层
     launcher.py             启动流程：缓存自动登录 → 主窗口 / 登录窗口；退出登录也在这里
-    login_window.py         登录 / 注册窗口（服务器地址、用户名、密码、记住我、测试连接）
+    login_window.py         登录 / 注册窗口（服务器地址、用户名、密码、邀请码、记住我、测试连接；明文 HTTP 会警告）
     new_chat_dialog.py      新建会话：搜人开单聊 / 勾人建群
     async_call.py           把网络调用扔到后台线程、结果回主线程（Qt 信号，线程安全）
     theme.py                颜色令牌（亮/暗）+ 全局 QSS + **文字大小（字号缩放）**
@@ -350,20 +388,24 @@ mchat/ui/                   界面层
     security_tool.py        安全工具箱（面板 + 对话框包装）
     main_window.py          主窗口：接线、主题、事件轮询、跟服务端对账、附件动作、设置
 server/                     服务端（**纯标准库，零依赖**，整个目录拷到服务器就能跑）
-    mchat_server.py         服务端本体：账号 / 会话 / 消息 / 长轮询 / 附件
+    mchat_server.py         服务端本体：账号 / 会话 / 消息 / 长轮询 / 附件（含邀请码、限流、各类上限）
     PROTOCOL.md             协议契约（客户端与服务端都按它实现）
-    README.md               部署文档（systemd / 防火墙 / HTTPS 反代 / 备份）
+    README.md               部署文档（systemd / 防火墙 / HTTPS 反代 / 备份 / 安全清单）
+    DEPLOY.md               **部署 runbook**：照着敲一遍就能上线（命令清单 + 上线自检 + 常见坑）
     mchat-server.service    systemd 单元文件
     run.bat                 Windows 上双击就能跑
-    selftest.py             服务端自检（193 项，起真进程跑完整流程）
+    selftest.py             服务端自检（226 项，起真进程跑完整流程）
 assets/flags.png            旗帜精灵图（本地素材，随包分发；生成物）
 assets/flags/*.png          逐张旗帜 PNG（消息文本 <img> 用；生成物）
 assets/demo/                两张演示附件素材（只给测试用，程序里不再引用）
 tools/build_flags.py        生成 flags.png + flags.py 的构建脚本（唯一联网的一步）
 tools/build_demo_assets.py  生成演示附件素材（QPainter 现画 + 手写最小 PDF，不联网）
-tests/                      13 套测试 / 718 项断言（见下面的「测试」一节）
+tests/                      16 套测试 / 273 项断言（见下面的「测试」一节）
 tests/seed.py               示例会话与自动回复台词（**只给测试用**，程序里不引用）
 tests/server_fixture.py     起一个真服务端给测试用（随机端口 + 临时数据目录）
+tests/test_hardening.py     安全加固回归：附件名清洗 / 落地路径 / 邀请码 / 限流 / 各类上限 / 令牌哈希 / 磁盘加密
+tests/test_atrest.py        静态加密回归：密钥存储（DPAPI）/ 加解密 / 老明文兼容 / 本地库与令牌真的是密文
+tests/test_ui_login_window.py  登录/注册窗口排版回归：尺寸锁定 / 该显示的字段 / 间距均匀 / 不被裁切
 ```
 
 减少重复的做法：会话条目、气泡、输入栏、工具箱都只有一份实现；文案与规则集中在
@@ -513,6 +555,11 @@ class ChatTransport(abc.ABC):              # mchat/core/transport.py
   **附件先上传再发**（收到时下到本地缓存，下不动就留着"点一下重试"）；
 - 主窗口每 400ms 调一次 `tick()`，把事件喂给 `ChatStore`，界面靠订阅刷新 —— 这条链路没动。
   `ChatStore` 内部有锁，网络线程直接 append 也是安全的；
+- **跨端状态一律"服务端存 + 服务端推 + 客户端按事件改"**：在线状态由服务端每几秒扫一遍
+  `last_seen`（`_presence_watcher`），一变就推给"跟他有共同会话的人"，界面收到 presence
+  就把仓库里的成员状态换掉、刷新小绿点与聊天头部第二行（`MainWindow._apply_presence`）。
+  客户端**不自己算**在线、也不在本地"开关式"地改 —— 唯一的例外是"改状态"这件小事，
+  它必须走 `ChatStore.set_user_online()`（frozen dataclass 只能换对象，见下面的坑）；
 - 登录、拉会话、拉历史、已读回执这些一次性请求走 `mchat/ui/async_call.py`：
   后台线程发请求、**Qt 信号**把结果排队送回主线程（不能直接回调 —— 那等于在后台线程碰界面）。
 
@@ -571,25 +618,30 @@ dist/frozen_check.exe --shot artifacts/frozen_flags.png
 ## 测试
 
 ```bash
-# 规范命令：一条跑完全部 13 套（718 项断言；端到端那套会真起服务端，要十几秒）
+# 规范命令：一条跑完全部 16 套（273 项断言；端到端那几套会真起服务端，要 ~2.5 分钟）
 .venv/Scripts/python.exe -m pytest tests -q
 
 # 也可以逐套直接跑（不依赖 pytest，会打印每项结果并生成截图）
 .venv/Scripts/python.exe tests/test_crypto.py          # 算法层 13 项
-.venv/Scripts/python.exe tests/test_chat_core.py       # 核心逻辑 37 项（零 Qt；含回复/多条置顶两种范围/转发/批量删除）
+.venv/Scripts/python.exe tests/test_chat_core.py       # 核心逻辑 41 项（零 Qt；含回复/多条置顶两种范围/转发/批量删除/截断不切半面旗/在线状态翻转）
 .venv/Scripts/python.exe tests/test_db.py              # 本地历史/检索/附件/回复转发/置顶与迁移 34 项（零 Qt）
 .venv/Scripts/python.exe tests/test_attachments.py     # 附件模型/传输/演示素材 14 项（零 Qt）
-.venv/Scripts/python.exe tests/test_account.py         # 账号缓存 + 线上 JSON → 模型 23 项（零 Qt）
-.venv/Scripts/python.exe tests/test_net.py             # 网络传输层（发件箱/重试/长轮询/附件）16 项
-.venv/Scripts/python.exe tests/test_server.py          # **端到端**：真起服务端，两个界面窗口互发消息 4 项
+.venv/Scripts/python.exe tests/test_account.py         # 账号缓存 + 线上 JSON → 模型 25 项（零 Qt）
+.venv/Scripts/python.exe tests/test_net.py             # 网络传输层（发件箱/重试/长轮询/附件）17 项
+.venv/Scripts/python.exe tests/test_server.py          # **端到端**：真起服务端，两个界面窗口互发消息 + 在线状态 + 关窗即退进程 11 项
 .venv/Scripts/python.exe tests/test_settings.py        # 字号缩放/档位表/样式表 8 项（不需要窗口）
 .venv/Scripts/python.exe tests/test_emoji.py           # 表情数据与搜索 14 项（零 Qt）
 .venv/Scripts/python.exe tests/test_flags.py           # 旗帜数据/素材/搜索/打包 21 项（零 Qt）
-.venv/Scripts/python.exe tests/test_flag_text.py       # 旗帜文本渲染 14 项（零 Qt）
+.venv/Scripts/python.exe tests/test_flag_text.py       # 旗帜文本渲染 15 项（零 Qt）
 .venv/Scripts/python.exe tests/test_security_tool.py   # 工具箱界面 53 项（含切方式保留输入）
-.venv/Scripts/python.exe tests/test_ui.py              # 聊天界面端到端 465 项（含动效/滚动/右键菜单/附件/设置/批量操作）
+.venv/Scripts/python.exe tests/test_ui.py              # 聊天界面端到端 474 项（含动效/滚动/右键菜单/附件/设置/批量操作/旗帜在每一处都是图）
+.venv/Scripts/python.exe tests/test_hardening.py       # 安全加固 33 项（附件名路径穿越/响应头注入/邀请码/限流与锁定/长度与配额/越权引用附件/放大器上限/连接数上限/令牌哈希/磁盘加密/ttl=0）
+.venv/Scripts/python.exe tests/test_atrest.py          # 静态加密 18 项（零 Qt：密钥存储与 DPAPI、加解密与篡改检测、老明文兼容、本地库/令牌落盘是密文、加密附件的临时解密）
+.venv/Scripts/python.exe tests/test_ui_login_window.py # 登录/注册窗口排版 7 项（尺寸锁定 / 两种模式同尺寸 / 字段顺序与可见性 / 间距均匀 / 不被裁切 / 回车跳格）
+#   ↑ 这一套必须排在最后（名字排序已满足）：它会真的创建控件，而 test_security_tool 里
+#     那几条按固定 pump 时长写的动画断言经不起"进程里先创建过控件"，原因不在它这段代码。
 
-# 服务端自己的自检（起真进程，193 项：账号/会话/消息/长轮询/附件/限额/优雅退出）
+# 服务端自己的自检（起真进程，226 项：账号/会话/消息/长轮询/附件/限额/加固闸门/优雅退出）
 .venv/Scripts/python.exe server/selftest.py
 ```
 
@@ -597,7 +649,9 @@ dist/frozen_check.exe --shot artifacts/frozen_flags.png
 起一个**真的服务端**（临时数据目录，退出即删），然后
 ①用 API 客户端走完账号/消息/附件/群聊/分页/幂等；②**开两个真实的聊天窗口**各登一个账号，
 一边发一边等另一边真的收到（含气泡、未读、已读回执、附件下载）；③登录窗口注册 →
-写本地缓存 → 下次启动**自动登录**（登录界面不再出现）→ 退出登录清缓存。
+写本地缓存 → 下次启动**自动登录**（登录界面不再出现）→ 退出登录清缓存；
+④对方上线/下线要真的画到界面上（小绿点 + 聊天头部第二行）；⑤**点 ✕ 关掉主窗口要在
+子进程里真的退出**（这条只有"进程自己退出了"才算过，见下）。
 假 HTTP 层测不出协议字段写错这类问题，所以这里一律用真服务端。
 
 pytest 已作为 dev 依赖装在项目 venv 里（`pyproject.toml` 的 `[dependency-groups] dev`）。
@@ -769,3 +823,23 @@ pytest 已作为 dev 依赖装在项目 venv 里（`pyproject.toml` 的 `[depend
   用逻辑坐标去 `copy(QRect)` 会裁到毫不相干的区域，测出来的数字全是错的。
 - **逐帧不做 QSS 解析**：动画只改字号与 `QPalette` 颜色；颜色令牌变了才重建样式表。
 - **自绘控件不嵌套布局**：标签、滑块、字段的几何全部手算，动画期间不会触发布局回流。
+- **frozen dataclass 不能就地改状态（"好友上线了我这边还显示离线"的真凶）**：成员是
+  `User(id, name, online, is_bot)` 这种 `@dataclass(frozen=True)`，`member.online = True`
+  会抛 `FrozenInstanceError`。单看这一行没什么，但它跑在 `tick()` 这条事件轮询里（Qt 定时器槽），
+  异常一冒整条 tick 就断在那儿 —— 服务端推过来的 presence 事件被"读到一半"就没了，表现正是
+  "对方上线/下线，我这边状态一直不变"。改状态一律 `dataclasses.replace()` 出新对象
+  （`ChatStore.set_user_online()` 一次把他出现的所有会话都换一遍），测试里那条
+  "冻结成员翻转"就是回归。教训：**状态对象是 frozen 时，"改一个字段"要当成"换一个对象"来写**。
+- **`quitOnLastWindowClosed(False)` 的代价：最后一个窗口关了程序也不退**：为了登录窗口/主窗口
+  交替时不会有"零窗口"的瞬间，这个开关是关掉的（见 `launcher.main`），于是主窗口被 ✕ 掉之后
+  **谁都不会让 QApplication 退出** —— 窗口没了，进程还挂在资源管理器里（长轮询线程、数据库连接、
+  内存全留着）。登录窗口那条路一直有 `_on_login_closed`，主窗口缺一个对等的：
+  `MainWindow.closeEvent` 收尾之后发 `closed` 信号 → `Launcher._on_main_closed` 里 `app.quit()`。
+  「退出登录」走的是 `logoutRequested` + `hide()`（`hide()` 不触发 `closeEvent`），不会被误伤。
+  配套三件事：① 关窗时给发件箱留 1.5 秒（否则"敲完就关"的那句话永远发不出去，而以前进程赖着
+  不走反倒"顺手"发出去了）；② 库关掉之后迟到的后台回调直接丢（`_shutdown_done` 闸门），
+  不然日志里会刷 `Cannot operate on a closed database`；③ 这件事**只能在子进程里验**
+  （判据就是"进程自己退出了"），所以 `test_server.py` 里那条用例会 spawn 一个真进程：
+  自动登录 → 开主窗口 → `window.close()` → 断言 `app.exec()` 返回 0 且总耗时正常。
+  它以前会一直挂着（用例里 20 秒后自杀报 TIMEOUT）—— 也就是说**这条用例是先看着它红、
+  再改代码的**。
