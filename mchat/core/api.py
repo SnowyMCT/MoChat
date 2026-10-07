@@ -15,8 +15,11 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import socket
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +38,127 @@ DEFAULT_TIMEOUT = 15.0
 SYNC_TIMEOUT_SLACK = 10.0        # 长轮询的 HTTP 超时 = 服务端等待时间 + 这点余量
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 REMOTE_SCHEME = Attachment.REMOTE_SCHEME     # 附件"还没下载到本地"时路径用的是它
+
+
+# ---------------------------------------------------------------------------
+# 能被打断的 HTTP：关窗口时别干等那条长轮询
+# ---------------------------------------------------------------------------
+# 为什么需要这一套
+#   ``urllib.request.urlopen`` 把 socket 藏在内部，谁也没法从外面把它掐断。于是关窗口时
+#   那条正挂在服务器上的长轮询（最长 20 秒）只能等到超时 —— 用户点 ✕ 之后窗口要卡好几秒
+#   才关（实测 3.0 秒起，掉线时更久），看起来像程序卡死；进程也就跟着多在任务管理器里
+#   待几秒。这里给每个 :class:`ApiClient` 配一个自己的 opener：连接一建立就登记，
+#   ``abort()`` 立刻 shutdown+close 掉，被阻塞的线程当场收到 OSError 返回（对上层就是
+#   一次普通的 NetworkError），几百毫秒内收工。
+# 为什么不做成全局的
+#   一个进程里可能同时活着两个窗口（测试里常见），全局掐断会把别人正在飞的正常请求
+#   一起打死。登记表挂在客户端实例上，各掐各的。
+class _LiveConnections:
+    """某个 ApiClient 手里"正在飞"的连接集合（线程安全）。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._conns: set = set()
+
+    def add(self, connection) -> None:
+        with self._lock:
+            self._conns.add(connection)
+
+    def discard(self, connection) -> None:
+        with self._lock:
+            self._conns.discard(connection)
+
+    def count(self) -> int:
+        """现在有几条请求正在飞（界面排障 / 测试用）。"""
+        with self._lock:
+            return len(self._conns)
+
+    def abort(self) -> int:
+        """掐断全部在飞的连接，返回掐断了几条（幂等，可以在收尾阶段放心调）。"""
+        with self._lock:
+            connections = list(self._conns)
+            self._conns.clear()
+        for connection in connections:
+            _force_close(getattr(connection, "sock", None))
+            try:
+                connection.close()
+            except Exception:                           # noqa: BLE001 —— 收尾不能抛
+                pass
+        return len(connections)
+
+
+def _force_close(sock) -> None:
+    """把 socket **真的**关掉，好让另一个线程里阻塞着的 recv 当场返回。
+
+    为什么不能只调 ``sock.close()``：``http.client`` 的 ``HTTPResponse`` 拿着一个
+    ``makefile()`` 包装，只要它还在，``socket.close()`` 就只是**标记**关闭、
+    不释放 fd（见 ``socket.py`` 的 ``_io_refs``），阻塞中的 ``recv`` 于是不会被叫醒 ——
+    Windows 上就得干等满整个超时（这就是"点了 ✕ 窗口还要卡几秒"的真正原因，
+    实测 3.0 秒起）。这里 shutdown 之后再 ``detach()`` 把 fd 交出来、用一个新的
+    socket 对象关掉它，这才是真正的 ``closesocket``：阻塞的 recv 立刻收到
+    ``WSAENOTSOCK``（实测 0.5 秒 → 0.00 秒）。
+    """
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)             # 先发 FIN：服务端那边也立刻收工
+    except OSError:
+        pass
+    try:
+        fd = sock.detach()                          # 只交出 fd，不关它
+    except (OSError, ValueError):
+        return
+    if not isinstance(fd, int) or fd < 0:
+        return
+    try:
+        socket.socket(fileno=fd).close()            # 真正 closesocket → 唤醒阻塞的 recv
+    except OSError:
+        pass
+
+
+class _TrackedConnection(http.client.HTTPConnection):
+    """把自己登记到 ``registry`` 的 HTTP 连接。"""
+
+    def __init__(self, *args, registry=None, **kwargs):
+        self._registry = registry
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        super().connect()
+        if self._registry is not None:
+            self._registry.add(self)
+
+    def close(self) -> None:
+        if self._registry is not None:
+            self._registry.discard(self)
+        super().close()
+
+
+class _TrackedHTTPSConnection(_TrackedConnection, http.client.HTTPSConnection):
+    """同上，https 版。"""
+
+
+class _TrackedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, registry, **kwargs):
+        super().__init__(**kwargs)
+        self._registry = registry
+
+    def http_open(self, req):
+        registry = self._registry
+        return self.do_open(lambda host, **kw: _TrackedConnection(host, registry=registry, **kw),
+                            req)
+
+
+class _TrackedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, registry, **kwargs):
+        super().__init__(**kwargs)
+        self._registry = registry
+
+    def https_open(self, req):
+        registry = self._registry
+        return self.do_open(
+            lambda host, **kw: _TrackedHTTPSConnection(host, registry=registry, **kw),
+            req, context=self._context, check_hostname=self._check_hostname)
 
 
 class ApiError(Exception):
@@ -348,6 +472,28 @@ class ApiClient:
         self.token = token or ""
         self.timeout = float(timeout)
         self.user_agent = user_agent
+        # 自己这套 opener 唯一的作用是"连接可被 abort() 掐断"（见上面的说明）。
+        # 该有的默认 handler（代理、重定向、错误码）build_opener 照样会补上。
+        self._live = _LiveConnections()
+        self._opener = urllib.request.build_opener(
+            _TrackedHTTPHandler(self._live), _TrackedHTTPSHandler(self._live))
+
+    # ------------------------------------------------------------------ 打断
+    def abort(self) -> int:
+        """掐断这个客户端**所有**还在飞的请求（关窗口 / 退出登录时调）。
+
+        它做的事就是让被阻塞的调用立刻抛 :class:`NetworkError` 返回 —— 没有它，
+        关窗口只能干等那条长轮询挂完（最多 20 秒）。返回掐断了几条，方便测试断言。
+        """
+        return self._live.abort()
+
+    def live_requests(self) -> int:
+        """现在有几条请求正在飞（0 = 都收工了）。
+
+        测试用它断言"长轮询真的挂上了"（不然 ''stop 很快'' 可能只是因为没有请求在跑），
+        排障时也能一眼看出还有几条连接没下来。
+        """
+        return self._live.count()
 
     # ------------------------------------------------------------------ 底层
     def _url(self, path: str, query: dict | None = None) -> str:
@@ -376,7 +522,9 @@ class ApiClient:
             headers["Authorization"] = f"Bearer {self.token}"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
+            # 走自己的 opener（不是 urllib.request.urlopen）：这样这条连接能被
+            # ApiClient.abort() 立刻掐断 —— 关窗口时不用干等长轮询挂完。
+            with self._opener.open(request, timeout=timeout or self.timeout) as response:
                 return response.read()
         except urllib.error.HTTPError as error:            # 服务端明确回了错误
             payload = b""

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -564,16 +565,20 @@ def test_ui_two_clients_exchange_messages(server):
                         timeout=15), bob_window.connection_text()
         assert bob_window.connection_text().startswith("鲍勃 · "), bob_window.connection_text()
 
-        # alice 建会话并打开（界面路径：+ 新建会话窗口 -> 服务端建单聊）
-        dialog = alice_window.open_new_chat()
-        dialog.search_field.setText("ui_bob")
-        dialog.run_search()
-        assert wait_for(case.app, lambda: "ui_bob" in dialog.rows(), timeout=15), \
-            dialog.status_text()
-        dialog.choose_user("ui_bob")
+        # 单聊是"同意好友"那一刻服务端建的（server_fixture.make_friends 走的就是真实
+        # 产品流程：alice 发申请 -> bob 同意）—— 界面这边等它推过来就行。
+        # 左栏「＋」现在只做群聊，所以不再有"在新建会话窗口里点一下开单聊"这条路。
+        alice_window.load_conversations()
         assert wait_for(case.app, lambda: len(alice_window.store.conversations()) == 1,
                         timeout=15), "alice 那边应该出现和 bob 的会话"
         conversation_id = alice_window.store.conversations()[0].id
+
+        # 「＋」打开的是**只做群聊**的窗口：找人开聊那套 UI 已经删掉了
+        plus = alice_window.open_new_chat()
+        assert plus.windowTitle() == "新建群聊", plus.windowTitle()
+        assert not hasattr(plus, "mode_seg"), "「找人聊天 / 新建群聊」分段控件不该还在"
+        assert not hasattr(plus, "choose_user"), "点了就开单聊的入口不该还在"
+        plus.close()
 
         # bob 那边应该被服务端"推"出来这个会话（不用手动刷新）
         assert wait_for(case.app, lambda: len(bob_window.store.conversations()) == 1,
@@ -697,7 +702,8 @@ def test_closing_the_main_window_quits_the_process(server):
     为什么要在子进程里验：这件事的判据就是"进程没了"。``quitOnLastWindowClosed``
     为了登录窗口/主窗口交替是关着的，所以最后一个窗口关掉之后谁都不退 ——
     原来的表现正是"窗口关了、进程还挂在任务管理器里"。这里跑一个真进程：
-    自动登录 → 开主窗口 → 300ms 后点 ✕ → 看 ``app.exec()`` 是否返回、进程是否退出。
+    自动登录 → 开主窗口 → 等长轮询挂上（4 秒）→ 点 ✕ → 看 ``app.exec()`` 是否返回、
+    进程是否退出，顺带断言"关窗本身"没在等网络（修之前那里卡满 3 秒 join 超时）。
     """
     import subprocess
 
@@ -715,15 +721,24 @@ def test_closing_the_main_window_quits_the_process(server):
         assert done.returncode == 0, (done.returncode, done.stdout, done.stderr)
         assert "EXIT 0" in done.stdout, (done.stdout, done.stderr)
         assert "MAIN OPEN" in done.stdout, (done.stdout, done.stderr)
-        assert elapsed < 45, f"关窗之后进程拖了 {elapsed:.1f}s 才退出"
+        # ① 关窗本身快不快：`window.close()` 是**同步**的，收尾里要是去 join 那条挂在
+        #    20 秒长轮询上的线程，这里就得等满超时（修之前实测 3.0 秒），用户看到的就是
+        #    "点了 ✕ 要等几秒才关"。现在是 stop() 先 api.abort() 掐断连接，几十毫秒。
+        match = re.search(r"CLOSE ([0-9.]+)", done.stdout)
+        assert match, (done.stdout, done.stderr)
+        close_cost = float(match.group(1))
+        assert close_cost < 1.0, f"关窗本身花了 {close_cost:.2f} 秒（又在 join 长轮询？）"
+        # ② 关完之后进程要真退（不是"窗口没了、python 还在"）
+        assert elapsed < 20, f"关窗之后进程拖了 {elapsed:.1f}s 才退出"
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
 
 _QUIT_PROBE = '''
-# 真跑一遍"登录 → 主窗口 → 点 ✕ → 进程退出"，判据是进程自己退出。
+# 真跑一遍"登录 → 主窗口 → 点 ✕ → 进程退出"，判据是进程自己退出（外加拿一个关窗耗时）。
 import os
 import sys
+import time
 
 sys.path.insert(0, r"{root}")
 from PyQt6.QtCore import QTimer
@@ -758,9 +773,13 @@ def main() -> int:
             app.exit(9)
             return
         print("MAIN OPEN", flush=True)
+        start = time.time()
         window.close()                             # 就是点右上角那个 ✕
+        print("CLOSE %.3f" % (time.time() - start), flush=True)
 
-    QTimer.singleShot(1200, click_x)
+    # 等久一点再点 ✕：让那条 20 秒的长轮询**真的挂上去**（第一次同步是 2 秒短超时，
+    # 太早点的话量到的不是长轮询那条路）。修之前这里会卡满 join 超时 ≈ 3 秒。
+    QTimer.singleShot(4000, click_x)
     QTimer.singleShot(20000, lambda: (print("TIMEOUT", flush=True), app.exit(7)))
     code = app.exec()
     print(f"EXIT {code}", flush=True)

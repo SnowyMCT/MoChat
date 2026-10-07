@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import time
 import uuid
+from dataclasses import replace
 
 from PyQt6.QtCore import QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (QColor, QDesktopServices, QGuiApplication, QKeySequence,
@@ -35,7 +37,7 @@ from ..core.models import (ME_ID, Attachment, ChatKind, Conversation, Message, P
                           User)
 from ..core.paths import resolve_attachment_path
 from ..core.store import FRIENDS, MESSAGE, PIN, RESET, ChatStore, StoreEvent
-from ..core.transport import (EVENT_CONVERSATION, EVENT_FRIEND_REQUEST,
+from ..core.transport import (EVENT_ATTACHMENT_SENT, EVENT_CONVERSATION, EVENT_FRIEND_REQUEST,
                               EVENT_MESSAGE, EVENT_PIN, EVENT_PRESENCE,
                               EVENT_REACTION, EVENT_READ, EVENT_RESYNC,
                               EVENT_SEND_BLOCKED, EVENT_TYPING,
@@ -43,13 +45,14 @@ from ..core.transport import (EVENT_CONVERSATION, EVENT_FRIEND_REQUEST,
                               NullTransport, Outgoing)
 from ..core.net_transport import NetworkTransport
 from ..core.session import Session
-from .attach import pick_file
+from .attach import pick_file, pick_save_path
 from .chat_view import ATTACH_FILE, ChatView
 from . import anim
 from .async_call import AsyncCall
 from .forward_dialog import ForwardDialog
 from .forward_view import MergedViewerDialog
 from .friends_dialog import BLOCKED_NOTICE, FriendsDialog
+from .image_view import ImageViewerDialog
 from .new_chat_dialog import NewChatDialog
 from .notify import Notifier
 from .pin_dialog import ask_pin as ask_pin_dialog
@@ -100,7 +103,7 @@ class MainWindow(QWidget):
 
     def __init__(self, parent: QWidget | None = None, *, demo=None,
                  transport=None, settings=None, log=None, confirm=None,
-                 filedialog=None, ask_pin=None, clipboard=None,
+                 filedialog=None, savedialog=None, ask_pin=None, clipboard=None,
                  session: Session | None = None, api=None):
         super().__init__(parent)
         # 收尾闸门：**放在最前面**（构造中途也可能派发事件，收尾/回调里都会读它）
@@ -151,6 +154,7 @@ class MainWindow(QWidget):
         self._settings_dialog: SettingsDialog | None = None
         self._forward_dialog: ForwardDialog | None = None
         self._merged_viewer: MergedViewerDialog | None = None
+        self._image_viewer: ImageViewerDialog | None = None
         self._new_chat_dialog: NewChatDialog | None = None
         self._friends_dialog: FriendsDialog | None = None
         # 桌面通知 + 提示音：构造**永不失败**（无托盘/无音频后端时内部静默降级），
@@ -163,6 +167,7 @@ class MainWindow(QWidget):
         # 各会话"还没发出去的附件/待回复的那条"（和草稿一样按会话存，切换会话不会串台）
         self._pending_attachments: dict[str, Attachment] = {}
         self._pending_replies: dict[str, object] = {}
+        self._fetching: set[str] = set()            # 正在从服务器取回的附件（别反复触发）
         self._forward_ids: list[str] = []          # 转发窗口里"这次要转发哪几条"
         # 联网用的三条后台调用通道（各自只干一类活，互不阻塞）
         self._load_call = AsyncCall(self)          # 拉会话列表
@@ -202,6 +207,8 @@ class MainWindow(QWidget):
             self, self.current_palette(), **kw))
         # 文件选择框同样可以注入（QFileDialog 是模态窗口，无头测试里会卡住）
         self._pick = filedialog if filedialog is not None else pick_file
+        # 「另存为」也走注入：模态文件对话框在无头测试里会一直等下去
+        self._save_pick = savedialog if savedialog is not None else pick_save_path
         self._hydrated = self._hydrate_history()
 
         self._build_ui()
@@ -594,7 +601,10 @@ class MainWindow(QWidget):
         if message is None or not path or not os.path.isfile(path):
             self.toast.show_message("附件下载失败", "warning", 2200)
             return
-        message.attachment = Attachment.from_path(path)
+        previous = message.attachment                  # 取回前的形态（带着服务器那份 id）
+        message.attachment = previous.localized_at(path) if previous is not None \
+            else Attachment.from_path(path)      # 换成本地路径，但**保住服务器那份 id**
+        self._fetching.discard(message_id)
         self._log.save_message(message)             # 记下来：下次不用再下
         conversation = self._store.get(message.conversation_id)
         if conversation is not None and message.conversation_id == self._current_id:
@@ -603,16 +613,25 @@ class MainWindow(QWidget):
             self.chat_view.show_conversation(conversation)
             self._sync_reactions(message.conversation_id)
         self._sync_connection_hint()
-        if payload.get("open"):
+        if payload.get("view"):
+            # 点图片 → 先下载 → 下完直接在查看器里打开（中间不再弹"已下载"那一句）
+            self.view_image(message_id)
+        elif payload.get("open"):
             self.attachment_action(message_id, "open")
         else:
             self.toast.show_message("附件已下载", "success", 1600)
 
-    def download_attachment(self, message_id: str, *, open_after: bool = False) -> bool:
-        """把还在服务器上的附件下到本地（点开它时走这条路）。"""
+    def download_attachment(self, message_id: str, *, open_after: bool = False,
+                            view_after: bool = False) -> bool:
+        """把还在服务器上的附件下到本地（点开它时走这条路）。
+
+        ``view_after`` = 下完之后在**图片查看器**里打开（点图片那条路）；
+        ``open_after`` = 下完之后交给系统程序打开（右键菜单「打开」那条路）。
+        """
         message = self._store.message(message_id)
         attachment = message.attachment if message is not None else None
-        if message is None or attachment is None or not attachment.is_remote:
+        if message is None or attachment is None or not (attachment.is_remote
+                                                        or attachment.recoverable):
             return False
         api, transport = self._api, self._transport
         if api is None:
@@ -623,9 +642,9 @@ class MainWindow(QWidget):
                                              attachment.remote_id, attachment.name))
 
         def work():
-            api.download(attachment.remote_id, dest, root=self.attachment_dir())
+            api.download(attachment.source_id, dest, root=self.attachment_dir())
             return {"kind": "download", "message_id": message_id, "path": dest,
-                    "open": open_after}
+                    "open": open_after, "view": view_after}
 
         if not self._action_call.run(work):
             return False
@@ -634,6 +653,10 @@ class MainWindow(QWidget):
 
     def _on_net_error(self, error) -> None:
         """后台调用失败：不弹窗、不打断，用提示条说清楚；登录失效就退回登录界面。"""
+        if self._shutdown_done:
+            # 关窗时收尾会先把在飞的请求全掐断（api.abort），那些请求会以
+            # NetworkError/ApiError 的形式回来 —— 窗口已经在关了，别再动界面。
+            return
         if isinstance(error, ApiError):
             if error.is_auth and not self._auth_notified:
                 self._auth_notified = True
@@ -662,10 +685,10 @@ class MainWindow(QWidget):
         self.sidebar.set_mode_hint(f"{name} · {describe()}" if name else describe())
 
     # ======================================================================
-    # 新建会话：找人开聊 / 拉群
+    # 新建群聊（和某人开聊走「好友」窗口：申请 -> 对方同意 -> 服务端建单聊）
     # ======================================================================
     def open_new_chat(self) -> NewChatDialog:
-        """左栏那个「＋」：打开新建会话窗口（没有服务器时明确说一句，别装作能建）。"""
+        """左栏那个「＋」：打开新建群聊窗口（没有服务器时明确说一句，别装作能建）。"""
         if self._api is None:
             self.toast.show_message("没连上服务器，建不了新会话", "warning", 2200)
             raise RuntimeError("没有服务器连接：请先登录")
@@ -684,7 +707,7 @@ class MainWindow(QWidget):
         return self._new_chat_dialog
 
     def on_conversation_created(self, data) -> Conversation | None:
-        """服务端建好了会话（单聊或群聊）：加进列表、直接打开。"""
+        """服务端建好了会话（群聊走这里；单聊是"同意好友"时服务端建的）：加进列表、直接打开。"""
         from ..core.api import conversation_from_json
 
         conversation = conversation_from_json(data, me_id=self._user_id)
@@ -1477,16 +1500,21 @@ class MainWindow(QWidget):
         return os.path.join(tempfile.gettempdir(), "mchat-clipboard")
 
     def attachment_action(self, message_id: str, action: str = "open") -> bool:
-        """打开附件本身 / 打开它所在的文件夹（点气泡或右键菜单都会走到这里）。"""
+        """附件上的动作：看大图（``"view"``）/ 用系统程序打开（``"open"``）/ 打开所在文件夹。
+
+        点气泡里的图片、右键菜单、通知都汇到这里 —— 行为只有一处定义。
+        """
         message = self._store.message(message_id)
         attachment = message.attachment if message is not None else None
         if attachment is None:
             return False
-        if attachment.is_remote:
-            # 还在服务器上：先下下来（下完自动打开），别让用户看着"打不开"发愣
+        if action == "view":
+            return self.view_image(message_id)
+        if attachment.is_remote or attachment.recoverable:
+            # 还在服务器上（没下载过 / 或者本地那份被删了）：先取回来，别让用户看着"打不开"发愣
             if action == "folder":
-                self.toast.show_message("文件还没下载，先打开一次再找它所在的文件夹",
-                                        "info", 2200)
+                self.toast.show_message("文件还没取回来，先打开一次再找它所在的文件夹",
+                                        "info", 2400)
                 return False
             return self.download_attachment(message_id, open_after=True)
         if action == "folder":
@@ -1507,6 +1535,104 @@ class MainWindow(QWidget):
             self.toast.show_message(f"这个附件打不开：{error}", "warning", 3200)
             return False
         QDesktopServices.openUrl(QUrl.fromLocalFile(plain))
+        return True
+
+    # ---- 图片查看器（点图片看大图，QQ 那种） ----
+    def view_image(self, message_id: str) -> bool:
+        """点图片：在**应用内的查看器**里看大图（不是交给系统看图器）。
+
+        还在服务器上的图片会先下载，下完自动打开查看器 —— 点一下就有反应，
+        不用让用户先"下载"再"打开"。
+        """
+        message = self._store.message(message_id)
+        attachment = message.attachment if message is not None else None
+        if message is None or attachment is None or attachment.kind != "image":
+            return False
+        if attachment.is_remote or attachment.recoverable:
+            return self.download_attachment(message_id, view_after=True)
+        if not attachment.exists:
+            self.toast.show_message(f"图片已经不在这个位置了：{attachment.name}",
+                                    "warning", 2600)
+            return False
+        return self.open_image_view(message_id) is not None
+
+    def open_image_view(self, message_id: str) -> ImageViewerDialog | None:
+        """打开（或复用）图片查看器，定位到这条消息的图片。
+
+        查看器里的 ``‹ ›`` 翻的是**当前会话里所有能看的图片**（本地已有的那些），
+        和 QQ 一样：点开一张就能顺手往下看。
+        """
+        _, message = self._store.locate(message_id)
+        attachment = message.attachment if message is not None else None
+        if message is None or attachment is None or attachment.kind != "image":
+            return None
+        items = self._conversation_images(message.conversation_id)
+        if not items:
+            return None
+        index = next((position for position, item in enumerate(items)
+                      if item[0] == message_id), None)
+        if index is None:
+            # 这张图没能进列表（不在本地了 / 不是图片）→ **不许顺手打开会话里别的图**，
+            # 否则用户点一张"已经丢了的图"却看到另一张，比直接报错还糟
+            return None
+        if self._image_viewer is None:
+            viewer = ImageViewerDialog(self)
+            viewer.revealRequested.connect(self._reveal_image)
+            viewer.saveRequested.connect(self._save_image)
+            viewer.imageChanged.connect(self._on_viewer_image_changed)
+            self._image_viewer = viewer
+        viewer = self._image_viewer
+        viewer.set_images(items, index)
+        viewer.apply_palette(self.current_palette())
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
+        return viewer
+
+    def image_viewer(self) -> ImageViewerDialog | None:
+        return self._image_viewer
+
+    def _conversation_images(self, conversation_id: str) -> list[tuple[str, str, str]]:
+        """会话里"能直接看"的图片：``[(message_id, 路径, 文件名), …]``（按时间顺序）。"""
+        conversation = self._store.get(conversation_id)
+        messages = conversation.messages if conversation is not None else []
+        items: list[tuple[str, str, str]] = []
+        for message in messages:
+            attachment = message.attachment
+            if attachment is not None and attachment.kind == "image" and (
+                    attachment.exists or attachment.source_id):
+                # 本地没有但服务器上还有的（自己发出去又删了本地那份）也要进列表：
+                # 翻到它时查看器显示"正在下载"，主窗口顺手把它取回来
+                items.append((message.id, attachment.path if attachment.exists else "",
+                              attachment.name))
+        return items
+
+    def _reveal_image(self, message_id: str) -> None:
+        """查看器里的「在文件夹中显示」→ 复用附件那条老路（统一判断文件还在不在）。"""
+        self.attachment_action(message_id, "folder")
+
+    def _save_image(self, message_id: str) -> bool:
+        """查看器里的「另存为」：把图**明文**复制到用户选的位置（附件本体是加密落盘的）。"""
+        message = self._store.message(message_id)
+        attachment = message.attachment if message is not None else None
+        if message is None or attachment is None or not attachment.exists:
+            self.toast.show_message("这张图已经不在本地了，没法另存", "warning", 2400)
+            return False
+        target = self._save_pick(attachment.name, parent=self)
+        if not target:
+            return False                              # 用户取消了：什么都不做、也不提示
+        try:
+            source = materialize(attachment.path)     # 加密落盘的附件先解成明文再拷
+            target = os.path.abspath(str(target))
+            if os.path.abspath(source) == target:
+                self.toast.show_message("已经保存到这个位置了", "info", 2000)
+                return True
+            with open(source, "rb") as reader, open(target, "wb") as writer:
+                shutil.copyfileobj(reader, writer)
+        except (AtRestError, OSError) as error:
+            self.toast.show_message(f"保存失败：{error}", "warning", 3000)
+            return False
+        self.toast.show_message(f"已保存到 {target}", "success", 2400)
         return True
 
     def pending_attachment(self) -> Attachment | None:
@@ -1545,6 +1671,9 @@ class MainWindow(QWidget):
             elif event.kind == EVENT_SEND_BLOCKED:
                 # 我发的消息被好友门禁拦成了申请：本地那条要换个样子，别一直像发出了
                 self._apply_blocked(event.conversation_id, event.message_id)
+            elif event.kind == EVENT_ATTACHMENT_SENT:
+                # 我发出去的附件在服务端叫什么 id：记下来（本地那份删了还能取回）
+                self._apply_attachment_sent(event)
             elif event.kind in FRIEND_EVENT_KINDS:
                 self._apply_friend_event(event)
             elif event.kind == EVENT_RESYNC:
@@ -1870,6 +1999,37 @@ class MainWindow(QWidget):
         except Exception:                            # noqa: BLE001 —— 通知不许影响收消息
             pass
 
+    def _apply_attachment_sent(self, event) -> None:
+        """记下"我这条消息的附件在服务端是哪一份"，并存进本地库。
+
+        为什么必须记：用户事后把本地那份图片/文件删了，消息不该只会说"不在本地了" ——
+        服务器上那份一直留着（只要这条消息还在就不会被孤儿回收），按这个 id 能一键取回。
+        """
+        message = self._store.message(event.message_id)
+        attachment = message.attachment if message is not None else None
+        if message is None or attachment is None or not event.attachment_id:
+            return
+        if attachment.server_id == event.attachment_id:
+            return
+        message.attachment = replace(attachment, server_id=event.attachment_id)
+        if not self._shutdown_done:
+            self._log.save_message(message)
+
+    def _on_viewer_image_changed(self, message_id: str) -> None:
+        """查看器翻到一张"本地没有、服务器上还有"的图：自动去取回来。
+
+        取回途中查看器显示"正在下载 …"，下完再刷一次（同一张图不会重复触发）。
+        """
+        message = self._store.message(message_id)
+        attachment = message.attachment if message is not None else None
+        if attachment is None or attachment.exists or not attachment.source_id:
+            return
+        if message_id in self._fetching:
+            return
+        self._fetching.add(message_id)
+        if not self.download_attachment(message_id, view_after=True):
+            self._fetching.discard(message_id)
+
     def _apply_blocked(self, conversation_id: str, message_id: str) -> None:
         """消息被好友门禁拦成申请：本地那条标成 blocked（**不重发**）并明确提示。"""
         if conversation_id and message_id:
@@ -1994,6 +2154,8 @@ class MainWindow(QWidget):
             self._forward_dialog.apply_palette(p)
         if self._merged_viewer is not None:
             self._merged_viewer.apply_palette(p)
+        if self._image_viewer is not None:
+            self._image_viewer.apply_palette(p)
         if self._new_chat_dialog is not None:
             self._new_chat_dialog.apply_palette(p)
         if self._friends_dialog is not None:
@@ -2111,16 +2273,20 @@ class MainWindow(QWidget):
         # 关窗前把还压在发件箱里的消息尽量送出去（有上限，别让"关窗口"卡住）。
         # 现在关窗＝整个进程立刻退出，不给发件箱一点时间的话，刚敲完的那句
         # 就只留在本地库里、永远发不出去（本地演示/离线传输层没有 flush，跳过）。
+        # **只在真有东西待发时才等**：平时根本不进这个分支（零耗时），
+        # 否则为了"最后一句"让关窗慢一下也值（上限 1 秒，原来 1.5 秒）。
         flush = getattr(self._transport, "flush", None)
-        if callable(flush):
+        pending = getattr(self._transport, "pending", None)
+        if callable(flush) and (pending() if callable(pending) else 0):
             try:
-                flush(wait=1.5)
+                flush(wait=1.0)
             except Exception:                            # noqa: BLE001 —— 收尾阶段不能再抛
                 pass
+        # stop() 里会先 api.abort() 把挂在半空的长轮询/上传掐断，所以这里不等网络。
         self._transport.stop()
         self._notifier.stop()                            # 收掉托盘 / 停掉提示音（幂等）
         for dialog in (self._search_dialog, self._settings_dialog, self._forward_dialog,
-                       self._merged_viewer, self._new_chat_dialog,
+                       self._merged_viewer, self._image_viewer, self._new_chat_dialog,
                        self._friends_dialog):
             if dialog is not None:
                 dialog.close()

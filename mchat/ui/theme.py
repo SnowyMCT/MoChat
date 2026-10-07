@@ -25,6 +25,10 @@ THEME_DARK = "暗色"
 THEME_SYSTEM = "跟随系统"
 THEME_OPTIONS = (THEME_LIGHT, THEME_DARK, THEME_SYSTEM)
 
+# 图片查看器的画布底色：**不跟主题走**（亮色主题下也保持深色）。看图时背景越中性越好，
+# 白色背景会晃眼，也会让暗部细节的观感失真 —— 系统看图器和 QQ 都是深色底。
+IMAGE_CANVAS = "#14181C"
+
 
 # ---------------------------------------------------------------------------
 # 文字大小（全局字号缩放）
@@ -418,7 +422,7 @@ def build_qss(p: Palette, *, scale: float | None = None) -> str:
     QLabel#hint {{ font-size: 11px; color: {p.muted}; }}
 
     /* ---------------------------------------------------- 登录窗口 -- */
-    /* 状态行 / 用户行（新建会话）—— 登录窗口整窗用 build_qss，自带卡片与主按钮样式 */
+    /* 状态行 / 用户行（新建群聊）—— 登录窗口整窗用 build_qss，自带卡片与主按钮样式 */
     QLabel#loginStatus {{ font-size: 12px; color: {p.muted}; }}
     QWidget#userRow {{ background-color: {p.card}; border-radius: 10px; }}
     QWidget#userRow:hover {{ background-color: {p.item_selected}; }}
@@ -573,6 +577,39 @@ def build_qss(p: Palette, *, scale: float | None = None) -> str:
     }}
     QLabel#mergedBody {{ font-size: 12.5px; color: {p.text}; }}
     QLabel#mergedAttach {{ font-size: 12px; color: {p.accent}; }}
+
+    /* ---------------------------------------------------- 图片查看器 -- */
+    /* 点图片打开的大图窗口。画布固定深色：看图时背景不该跟着主题变白变亮，
+       会晃眼、也影响对色彩和明暗的判断（系统看图器、QQ 都这么干）。 */
+    QDialog#imageViewerRoot {{ background-color: {IMAGE_CANVAS}; }}
+    QScrollArea#imageViewerScroll, QWidget#imageViewerHost {{ background: transparent; }}
+    QLabel#imageViewerCanvas {{ background: transparent; color: #AAB6C2; }}
+    QFrame#imageViewerBar {{
+        background-color: {p.card};
+        border-top: 1px solid {p.border};
+    }}
+    QLabel#imageViewerInfo {{ font-size: 12px; color: {p.muted}; }}
+    QPushButton#viewerBtn {{
+        background-color: transparent;
+        border: 1px solid {p.border};
+        border-radius: 9px;
+        padding: 4px 11px;
+        font-size: 12.5px;
+        color: {p.text};
+    }}
+    QPushButton#viewerBtn:hover {{ border-color: {p.accent}; color: {p.accent}; }}
+    QPushButton#viewerBtn:pressed {{ background-color: {p.track}; }}
+    QPushButton#viewerBtn:disabled {{ color: {p.muted}; border-color: {p.border}; }}
+    QPushButton#viewerNav {{
+        background-color: transparent;
+        border: none;
+        border-radius: 8px;
+        font-size: 15px;
+        color: {p.text};
+    }}
+    QPushButton#viewerNav:hover {{ background-color: {p.track}; }}
+    QPushButton#viewerNav:disabled {{ color: {p.border}; }}
+
     /* 选中态：整条气泡描一圈主题色 */
     QFrame#bubbleIn[selected="true"], QFrame#bubbleOut[selected="true"] {{
         border: 1px solid {p.accent};

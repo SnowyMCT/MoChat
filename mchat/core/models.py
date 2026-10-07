@@ -151,6 +151,9 @@ class Attachment:
     path: str
     name: str = ""
     size: int = 0
+    #: 我发出去的附件在**服务器上的 id**（发成功后记下来）。本地那份被删掉以后，
+    #: 消息不该只说"不在本地了" —— 服务器上还有，能按这个 id 一键取回。
+    server_id: str = ""
     REMOTE_SCHEME = "remote://"          # 远程附件在 ``path`` 里的标记前缀
 
     def __post_init__(self) -> None:
@@ -183,6 +186,27 @@ class Attachment:
     def remote_id(self) -> str:
         """服务器上的附件 id；本地附件就是空串。"""
         return self.path[len(self.REMOTE_SCHEME):] if self.is_remote else ""
+
+    @property
+    def source_id(self) -> str:
+        """服务器上那份附件叫什么 id（两种情形：还没下载的看路径标记，自己发过的看
+        :attr:`server_id`）。是"去服务器取字节"唯一该用的 id。"""
+        return self.remote_id or self.server_id
+
+    @property
+    def recoverable(self) -> bool:
+        """本地这份没了，但**服务器上还有一份**（能取回来）。
+
+        典型场景：自己发出去的图，事后把本地文件删了 —— 服务器上那份是这条消息引用的
+        附件，一直在；界面不该说"图片不在本地了"就完事，而该说"点一下取回"。
+        """
+        return bool(self.server_id) and not self.is_remote and not self.exists
+
+    def localized_at(self, path: str) -> "Attachment":
+        """下载/取回之后的新形态：换成真实路径，但**继续带着服务器那份 id**
+        （这样以后再删掉本地文件，还是能一键取回）。"""
+        return Attachment(path=os.path.abspath(str(path)), name=self.name,
+                          size=self.size, server_id=self.source_id)
 
     @property
     def suffix(self) -> str:
@@ -223,7 +247,8 @@ class Attachment:
 
     # ---------------------------------------------------------------- 序列化
     def to_json(self) -> dict:
-        return {"path": self.path, "name": self.name, "size": self.size}
+        return {"path": self.path, "name": self.name, "size": self.size,
+                "server_id": self.server_id}
 
     @classmethod
     def from_json(cls, data) -> "Attachment | None":
@@ -237,7 +262,8 @@ class Attachment:
             size = int(data.get("size") or 0)
         except (TypeError, ValueError):
             size = 0
-        return cls(path=path, name=str(data.get("name") or ""), size=size)
+        return cls(path=path, name=str(data.get("name") or ""), size=size,
+                   server_id=str(data.get("server_id") or ""))
 
     def dump(self) -> str:
         """给 SQLite 用的 JSON 字符串（中文名不转义，库文件里看着就是原名）。"""

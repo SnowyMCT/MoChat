@@ -3,7 +3,7 @@
 为什么单独一个窗口（而不是塞进侧栏）：好友关系是**服务端权威**的，这一页要能一次
 看清三件事 —— 我的好友、别人申请加我（要同意/拒绝）、我申请加别人（等回应）——
 再叠上\"搜索用户发申请\"，信息量放不进 296px 的侧栏。所以侧栏只留一个入口按钮 +
-红点角标，真正的操作都在这个固定尺寸的小窗里（和新建会话窗口一致的写法）。
+红点角标，真正的操作都在这个固定尺寸的小窗里（和新建群聊窗口一致的写法）。
 
 几条铁律在这个文件里的落点：
 * **固定尺寸**：``setFixedSize`` + 原生不可拉伸标志（只设前者 Windows 上边框还会出现双向箭头）。
@@ -141,7 +141,7 @@ class FriendsDialog(QDialog):
         self._incoming_rows: list[PersonRow] = []
         self._outgoing_rows: list[PersonRow] = []
         self._result_rows: list[PersonRow] = []
-        # 三条独立通道：搜索 / 好友操作 / 互不阻塞（和新建会话窗口一个路子）
+        # 三条独立通道：搜索 / 好友操作 / 互不阻塞（和新建群聊窗口一个路子）
         self._search_call = AsyncCall(self)
         self._search_call.finished.connect(self._on_search_done)
         self._search_call.failed.connect(self._on_failed)

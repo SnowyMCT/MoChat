@@ -65,13 +65,22 @@ class ServerProcess:
             return ""
 
     def stop(self) -> None:
-        if self.process.poll() is None:
+        if self.process.poll() is not None:
+            return
+        if os.name == "nt":
+            # Windows 上一定要**连整棵树**一起收：venv 的 Scripts\python.exe 只是个壳，
+            # 真正跑起来的服务端是它 fork 出来的子进程，只 terminate() 壳子会把服务端
+            # 留成孤儿 —— 任务管理器里每个漏下的测试服务端正好是**两个** python，
+            # 攒几次就成了"关了软件还一堆 python 在跑"。
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.process.pid)],
+                           capture_output=True)
+        else:
             self.process.terminate()
-            try:
-                self.process.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=8)
+        try:
+            self.process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=8)
 
 
 def _health_ok(base_url: str, timeout: float = 2.0) -> bool:
@@ -96,14 +105,15 @@ def running_server(*, extra_args=(), keep: bool = False, relaxed: bool = True):
     data_dir = tempfile.mkdtemp(prefix="mchat-test-")
     log_path = os.path.join(data_dir, "server.log")
     port = free_port()
-    command = [sys.executable, SERVER_SCRIPT, "--host", "127.0.0.1", "--port", str(port),
+    python, env = _server_launch()
+    command = [python, SERVER_SCRIPT, "--host", "127.0.0.1", "--port", str(port),
                "--data", os.path.join(data_dir, "data")]
     if relaxed:
         command += ["--open-register", "--login-rate", "0", "--lock-after", "0"]
     command += list(extra_args)
     log = open(log_path, "w", encoding="utf-8")
     process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                               cwd=ROOT)
+                               cwd=ROOT, env=env)
     server = ServerProcess(process, f"http://127.0.0.1:{port}", data_dir, log_path)
     try:
         deadline = time.time() + START_TIMEOUT
@@ -121,6 +131,35 @@ def running_server(*, extra_args=(), keep: bool = False, relaxed: bool = True):
         log.close()
         if not keep:
             shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def _server_launch() -> tuple[str, dict | None]:
+    """跑服务端用哪个解释器、配什么环境变量。
+
+    为什么不用现成的 ``sys.executable``：venv 里的 ``Scripts\\python.exe`` 在 Windows 上
+    是个**重定向壳**，它会把真正的解释器再拉成一个子进程 —— 于是每个测试服务端在任务
+    管理器里占**两条** python（父壳 + 子解释器）。壳被 kill 掉、子进程留下就是孤儿，
+    攒几次就变成"跑过测试之后一堆 python 在跑"。直接用基础解释器跑就只剩一条，
+    ``terminate()``/``taskkill`` 也不会再漏。
+
+    代价是要自己把 venv 的 site-packages 带上（服务端的可选磁盘加密要 pycryptodome）：
+    走 ``PYTHONPATH`` 显式传过去，效果和 venv 里跑一样。不在 venv 里跑就直接用
+    ``sys.executable``、环境原样继承。
+    """
+    base = getattr(sys, "_base_executable", "") or ""
+    if not base or not os.path.isfile(base):
+        return sys.executable, None
+    if os.path.normcase(base) == os.path.normcase(sys.executable):
+        return sys.executable, None
+    env = dict(os.environ)
+    extra = [path for path in sys.path
+             if path and os.path.isdir(path)
+             and os.path.normcase(os.path.abspath(path)).startswith(
+                 os.path.normcase(os.path.abspath(sys.prefix)) + os.sep)]
+    if extra:
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join(extra + ([existing] if existing else []))
+    return base, env
 
 
 def make_friends(client_a, client_b, *, note: str = ""):

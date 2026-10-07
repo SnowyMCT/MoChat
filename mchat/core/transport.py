@@ -27,7 +27,8 @@ __all__ = ["Outgoing", "TransportEvent", "ChatTransport", "ReplyScript",
            "EVENT_MESSAGE", "EVENT_TYPING", "EVENT_READ", "EVENT_CONVERSATION",
            "EVENT_PIN", "EVENT_REACTION", "EVENT_PRESENCE", "EVENT_RESYNC",
            "EVENT_FRIEND_REQUEST", "EVENT_FRIEND_ACCEPT", "EVENT_FRIEND_REJECT",
-           "EVENT_FRIEND_REMOVE", "EVENT_SEND_BLOCKED", "FRIEND_EVENT_KINDS"]
+           "EVENT_FRIEND_REMOVE", "EVENT_SEND_BLOCKED", "EVENT_ATTACHMENT_SENT",
+           "FRIEND_EVENT_KINDS"]
 
 EVENT_MESSAGE = "message"
 EVENT_TYPING = "typing"
@@ -46,6 +47,7 @@ EVENT_FRIEND_REMOVE = "friend_remove"     # 对方把我删了（或我在别处
 FRIEND_EVENT_KINDS = (EVENT_FRIEND_REQUEST, EVENT_FRIEND_ACCEPT,
                       EVENT_FRIEND_REJECT, EVENT_FRIEND_REMOVE)
 EVENT_SEND_BLOCKED = "send_blocked"       # 我发的消息被好友门禁拦成了申请（不重发）
+EVENT_ATTACHMENT_SENT = "attachment_sent"  # 我发的附件在服务端的 id（本地删了能取回）
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,8 @@ class TransportEvent:
     online: bool = True        # EVENT_PRESENCE 用：这个人在线还是离线
     user: "User | None" = None  # EVENT_FRIEND_* 用：申请/同意的"另一个人"
     note: str = ""             # EVENT_FRIEND_REQUEST / EVENT_SEND_BLOCKED 用：留言
+    #: EVENT_ATTACHMENT_SENT 用：我刚发出去的附件在服务端叫什么 id
+    attachment_id: str = ""
 
 
 @dataclass

@@ -38,7 +38,7 @@ from .api import (ApiClient, ApiError, NetworkError, conversation_from_json,
                   message_from_json, reactions_from_json, user_from_json)
 from .models import Attachment, Conversation, Message
 from .paths import resolve_attachment_path
-from .transport import (EVENT_CONVERSATION, EVENT_FRIEND_ACCEPT,
+from .transport import (EVENT_ATTACHMENT_SENT, EVENT_CONVERSATION, EVENT_FRIEND_ACCEPT,
                         EVENT_FRIEND_REJECT, EVENT_FRIEND_REMOVE,
                         EVENT_FRIEND_REQUEST, EVENT_MESSAGE, EVENT_PIN,
                         EVENT_PRESENCE, EVENT_REACTION, EVENT_READ, EVENT_RESYNC,
@@ -146,10 +146,22 @@ class NetworkTransport(ChatTransport):
         for thread in self._threads:
             thread.start()
 
-    def stop(self, *, timeout: float = 3.0) -> None:
-        """停掉后台线程（关窗口时调）。**发件箱不清空**，只是不再发。"""
+    def stop(self, *, timeout: float = 0.8) -> None:
+        """停掉后台线程（关窗口时调）。**发件箱不清空**，只是不再发。
+
+        ``join`` 之前先 ``api.abort()``：收的那条线程通常正挂在服务器上的长轮询里
+        （最长 20 秒），不掐断就只能 join 到超时 —— 用户点 ✕ 之后窗口要卡好几秒
+        （实测 3.0 秒起，掉线时更久），像是程序卡死了。掐断之后线程几十毫秒内就
+        从 HTTP 里出来，``join`` 基本立刻返回。
+        """
         self._stop.set()
         self._wake.set()
+        abort = getattr(self.api, "abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except Exception:                            # noqa: BLE001 —— 收尾阶段不能再抛
+                pass
         for thread in list(self._threads):
             if thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=timeout)
@@ -205,7 +217,7 @@ class NetworkTransport(ChatTransport):
             return attachment
         if self.auto_download_max and attachment.size > self.auto_download_max:
             return attachment
-        file_id = attachment.remote_id
+        file_id = attachment.source_id
         dest = self.cache_path(attachment)
         try:
             if not os.path.isfile(dest):
@@ -226,7 +238,7 @@ class NetworkTransport(ChatTransport):
         也正是"附件名里带 ..\\ 就能写到下载目录外"这个洞的唯一补丁点。
         """
         folder = self.download_dir or tempfile.gettempdir()
-        return resolve_attachment_path(folder, attachment.remote_id, attachment.name)
+        return resolve_attachment_path(folder, attachment.source_id, attachment.name)
 
     # ================================================================== 后台线程
     def _poll_loop(self) -> None:
@@ -331,6 +343,14 @@ class NetworkTransport(ChatTransport):
         attachment = outgoing.attachment
         if attachment is not None and not attachment.is_remote:
             attachment_id = self._upload(attachment)
+        if attachment_id:
+            # 把"服务端那份附件叫什么 id"交给界面记下来（并落库）：用户事后删掉本地文件时，
+            # 消息才不至于只会说"不在本地了"—— 服务器上还有那份，能按这个 id 取回来。
+            event = TransportEvent(
+                kind=EVENT_ATTACHMENT_SENT, conversation_id=outgoing.conversation_id,
+                message_id=outgoing.message_id, attachment_id=attachment_id)
+            with self._lock:
+                self._events.append(event)
         result = self.api.send_message(
             outgoing.conversation_id, outgoing.message_id or _fallback_id(outgoing),
             outgoing.text, attachment_id=attachment_id, reply_to=outgoing.reply_to,

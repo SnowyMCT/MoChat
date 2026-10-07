@@ -442,10 +442,15 @@ def test_attachment_quota_is_enforced(tiny_account, tmp_path):
     blob.write_bytes(b"x" * 8000)
     first = tiny_account.upload(str(blob), name="a.bin")
     assert first["size"] == 8000
+    more = tmp_path / "more.bin"
+    more.write_bytes(b"y" * 8000)              # 内容**不同**：配额就该拦住它
     with pytest.raises(ApiError) as caught:
-        tiny_account.upload(str(blob), name="b.bin")
+        tiny_account.upload(str(more), name="b.bin")
     assert caught.value.code == "quota_exceeded"
     assert caught.value.status == 413
+    # 同一份内容再传一遍在服务端不占新空间 → **不该**被配额拦住（附件去重）
+    again = tiny_account.upload(str(blob), name="a-copy.bin")
+    assert again["deduped"] is True and again["id"] != first["id"]
 
 
 def test_typing_is_throttled_on_the_server(tiny_limits):
@@ -590,9 +595,20 @@ def test_disk_encryption_round_trip(tmp_path):
         payload = tmp_path / "图纸.png"
         payload.write_bytes(b"\x89PNG-fake-bytes-for-test")
         info = alice.upload(str(payload), name="2026年体检报告.png")
-        file_path = os.path.join(server.data_dir, "data", "files", info["id"])
+        # 字节是**按内容寻址**的（文件名是内容哈希，不再是附件 id）→ 落地名从 blobs 表查
+        blob = sqlite3.connect(db_path).execute(
+            "SELECT b.path FROM attachments a JOIN blobs b ON b.hash = a.content_hash "
+            "WHERE a.id=?", (info["id"],)).fetchone()
+        assert blob and str(blob[0]).startswith("b"), blob
+        file_path = os.path.join(server.data_dir, "data", "files", blob[0])
         with open(file_path, "rb") as handle:
             assert handle.read().startswith(b"MCHSRV1"), "附件字节必须加密落盘"
+        # 同样的字节再传一遍：不再占第二份（服务端只留一个文件）
+        again = alice.upload(str(payload), name="同一张图纸.png")
+        assert again["deduped"] is True and again["id"] != info["id"]
+        stored = [name for name in os.listdir(os.path.join(server.data_dir, "data", "files"))
+                  if not name.endswith(".part")]
+        assert stored == [blob[0]], stored
         landed = tmp_path / "landed.png"
         alice.download(info["id"], str(landed))
         assert landed.read_bytes() == b"\x89PNG-fake-bytes-for-test"

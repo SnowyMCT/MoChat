@@ -14,14 +14,16 @@
 为什么窗口之间的切换要这么小心
 ------------------------------
 两个窗口交替时会有"一个窗口都没有"的瞬间，``QApplication`` 默认会**直接退出**，
-所以这里把 ``quitOnLastWindowClosed`` 关掉，改成"**用户自己关掉登录窗口才算退出**"。
+所以这里把 ``quitOnLastWindowClosed`` 关掉，改成"**用户自己关掉窗口才算退出**"。
+正因如此，退出这件事必须显式做干净（``quit()`` + 兜底定时器，见 :meth:`Launcher._quit_app`）——
+否则窗口是没了、进程还挂在任务管理器里。
 """
 from __future__ import annotations
 
 import os
 import sys
 
-from PyQt6.QtCore import QObject, QSettings, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication
 
@@ -40,6 +42,13 @@ SETTINGS_ORG = "MChat"
 SETTINGS_APP = "MChat"
 SCOPE_LOGIN = "login"
 SCOPE_MAIN = "main"
+# 用户点 ✕ 之后，事件循环最多再转这么久；到点还没退出来就**强制结束进程**。
+# 为什么要有这一条：用户在意的是"关了窗口进程就得没" —— 只要哪里还挂着
+# （嵌套事件循环、某个窗口没关干净……），资源管理器里就会留下一个 python，
+# 攒几个就成了"关了软件还一堆 python 在跑"。正常路径是毫秒级退出，
+# 这个定时器根本轮不到触发，它只是"绝不留僵尸"的保险。
+QUIT_WATCHDOG_MS = 3000
+QUIT_LOG_NAME = "quit.log"
 
 
 class Launcher(QObject):
@@ -48,7 +57,8 @@ class Launcher(QObject):
     windowChanged = pyqtSignal(str)             # "login" / "main" / ""（都关了）
 
     def __init__(self, app: QApplication, *, session_store: SessionStore | None = None,
-                 api_factory=None, settings=None, main_factory=None, parent=None):
+                 api_factory=None, settings=None, main_factory=None, parent=None,
+                 quit_watchdog_ms: int = 0):
         super().__init__(parent)
         self.app = app
         # 静态加密的钥匙：先开出来，再让"当前进程"记住它 —— 附件预览、点开文件、
@@ -67,6 +77,11 @@ class Launcher(QObject):
         self._api: ApiClient | None = None
         self._pending_session: Session | None = None
         self._pending_api: ApiClient | None = None
+        # 0 = 不装保险（测试里直接建 Launcher 的场合：装了就可能在别的进程里
+        # 3 秒后强制 os._exit，把测试进程带走）。真入口 main() 会传一个正数。
+        self._quit_watchdog_ms = int(quit_watchdog_ms or 0)
+        self._quit_armed = False
+        self._quit_reason = ""          # 只为了日志里写清楚"是关哪个窗口触发的"
         self._probe = AsyncCall(self)
         self._probe.finished.connect(self._on_probe_ok)
         self._probe.failed.connect(self._on_probe_failed)
@@ -190,7 +205,7 @@ class Launcher(QObject):
         self._login = None
         if self._main is None:
             self.windowChanged.emit("")
-            self.app.quit()
+            self._quit_app("关了登录窗口")
 
     def on_logged_in(self, session: Session) -> None:
         """登录窗口报喜：开主窗口（缓存已由登录窗口写好）。"""
@@ -252,7 +267,56 @@ class Launcher(QObject):
         self._session, self._api = None, None
         if self._login is None:            # 屏幕上没有别的窗口了：收工
             self.windowChanged.emit("")
-            self.app.quit()
+            self._quit_app("关了主窗口")
+
+    # ================================================================== 收工
+    def _quit_app(self, why: str) -> None:
+        """退出事件循环；顺带装上"绝不留僵尸"的保险。
+
+        正常情况 ``quit()`` 一调，事件循环立刻返回、``main()`` 返回、进程结束。
+        但只要有嵌套事件循环（``QMessageBox.exec()`` 之类）或别的什么把 exec()
+        拖着，``quit()`` 就退不出来 —— 表现就是**窗口没了、任务管理器里的 python
+        还在**。所以这里再挂一个定时器兜底：到点还没退就强制结束进程。
+        """
+        self.app.quit()
+        self._quit_reason = why
+        if self._quit_watchdog_ms <= 0 or self._quit_armed:
+            return
+        self._quit_armed = True
+        # 两参数的 singleShot（PyQt6 里带上下文对象的三参数重载 + lambda 会崩进程）
+        QTimer.singleShot(self._quit_watchdog_ms, self._force_quit)
+
+    def _force_quit(self) -> None:
+        """定时器真触发了 = 事件循环没退出来。留一笔日志，然后强制结束进程。"""
+        _note_forced_quit(self._quit_reason)
+        try:
+            cleanup_view_cache()
+        except Exception:                            # noqa: BLE001 —— 都要走了
+            pass
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if stream is not None:
+                    stream.flush()
+            except Exception:                        # noqa: BLE001
+                pass
+        os._exit(0)                                  # 不再等任何线程/析构
+
+
+def _note_forced_quit(reason: str = "") -> None:
+    """记一笔"是被强制结束的"（``<数据目录>/logs/quit.log``），排障时一眼看得见。
+
+    日志写失败绝不能反过来把退出流程带崩 —— 整段包在 try 里。
+    """
+    try:
+        import time
+        folder = os.path.join(default_data_dir(), "logs")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, QUIT_LOG_NAME), "a", encoding="utf-8") as handle:
+            handle.write("%s %s后 %d ms 事件循环仍未退出，已强制结束进程\n"
+                         % (time.strftime("%Y-%m-%d %H:%M:%S"), reason or "关窗",
+                            QUIT_WATCHDOG_MS))
+    except Exception:                                # noqa: BLE001
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -269,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setOrganizationName(SETTINGS_ORG)
     app.setQuitOnLastWindowClosed(False)
     install_crash_log(default_crash_log_path(os.path.join(default_data_dir(), "logs")))
-    launcher = Launcher(app)
+    launcher = Launcher(app, quit_watchdog_ms=QUIT_WATCHDOG_MS)
     app._mchat_launcher = launcher        # 别让启动器被回收（窗口切换全靠它）
     launcher.start()
     try:

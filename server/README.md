@@ -158,7 +158,10 @@ sudo systemctl restart mchat-server      # 改完参数后重启
 ├── mchat.db                ← SQLite：账号、token、会话、成员、消息、附件元信息
 ├── mchat.db-wal            ← 运行时存在（WAL 预写日志），正常退出会合并进 mchat.db
 ├── mchat.db-shm
-└── files/<attachment_id>   ← 上传的附件原始字节（文件名就是附件 id，原文件名存在数据库里）
+└── files/<blob>            ← 上传的附件原始字节，**按内容存一份**：<blob> 是内容的
+                               sha256（"b" + 64 位 hex），同一份文件谁传几次都只占这一份。
+                               老数据仍是 files/<附件id>，服务端启动时自动归位（不改名）。
+                               原文件名存在数据库里（加密），磁盘上看不出来。
 ```
 
 **备份只需要备份整个 `<data>` 目录**（`mchat.db*` + `files/`）。两种做法：

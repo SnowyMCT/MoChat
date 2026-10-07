@@ -22,9 +22,9 @@ from ..core.models import Attachment
 from .icons import make_icon
 
 __all__ = ["THUMB", "IMAGE_MAX_WIDTH", "IMAGE_MAX_HEIGHT", "CARD_WIDTH",
-           "IMAGE_FILTER", "FILE_FILTER", "pick_file", "scaled_preview",
-           "attachment_meta", "AttachmentTray", "ImageAttachmentView",
-           "FileAttachmentView"]
+           "IMAGE_FILTER", "FILE_FILTER", "pick_file", "pick_save_path",
+           "scaled_preview", "attachment_meta", "AttachmentTray",
+           "ImageAttachmentView", "FileAttachmentView"]
 
 THUMB = 64                    # 待发送条里缩略图的边长
 IMAGE_MAX_WIDTH = 300         # 气泡里图片的最大显示尺寸（等比缩放，不裁切）
@@ -50,6 +50,19 @@ def pick_file(kind: str = "file", parent=None) -> str:
     path, _ = QFileDialog.getOpenFileName(
         parent, "选择图片" if image else "选择文件", "",
         IMAGE_FILTER if image else FILE_FILTER)
+    return path or ""
+
+
+def pick_save_path(suggested: str = "", parent=None) -> str:
+    """弹「另存为」对话框，返回目标路径（取消返回空串）。
+
+    和 :func:`pick_file` 同一个规矩：**测试别走这里**（模态窗口在无头环境会挂住），
+    ``MainWindow`` 的 ``savedialog`` 参数可以注入一个假实现，覆盖的是同一条代码路径。
+    """
+    path, _ = QFileDialog.getSaveFileName(
+        parent, "另存为", suggested or "",
+        f"{os.path.splitext(suggested or '')[1].lstrip('.').upper() or '所有'}文件 (*)"
+        if suggested else FILE_FILTER)
     return path or ""
 
 
@@ -91,8 +104,13 @@ def attachment_tooltip(attachment: Attachment) -> str:
     meta = attachment_meta(attachment).replace(" · ", "\n")
     lines.append(meta)
     lines.append(attachment.path)
-    lines.append("点击打开（右键可打开所在文件夹）" if attachment.exists
-                 else "⚠ 文件已不在本地")
+    if not attachment.exists:
+        lines.append("⚠ 本地文件已删除（服务器上还有）：点击取回"
+                     if attachment.recoverable else "⚠ 文件已不在本地")
+    elif attachment.kind == "image":
+        lines.append("点击查看大图（右键可打开所在文件夹）")
+    else:
+        lines.append("点击打开（右键可打开所在文件夹）")
     return "\n".join(lines)
 
 
@@ -199,9 +217,15 @@ class AttachmentTray(QWidget):
 
 # -------------------------------------------------------- 气泡里的图片
 class ImageAttachmentView(QLabel):
-    """气泡里的图片缩略图；点一下让系统看图器打开（"打开"动作由主窗口执行）。"""
+    """气泡里的图片缩略图；点一下**在应用内的查看器里看大图**（QQ 那种）。
 
-    activated = pyqtSignal(str)              # action: "open"
+    为什么不直接交给系统看图器：系统看图器是另一个程序，会抢焦点、还得先把加密落盘的
+    附件解成明文；而在自己的窗口里能接着翻会话里的下一张图（见 ``ui/image_view.py``）。
+    真要交给系统程序打开，右键菜单里还留着「打开」那条路。
+    """
+
+    VIEW_ACTION = "view"                     # 点缩略图 = 打开查看器（不是"用系统程序打开"）
+    activated = pyqtSignal(str)              # action: "view"
     menuRequested = pyqtSignal(object)       # 右键：把坐标抛给气泡去弹菜单
 
     def __init__(self, attachment: Attachment, parent=None):
@@ -220,7 +244,9 @@ class ImageAttachmentView(QLabel):
             # +2 是给 QSS 的 1px 边框留位置，否则边框会盖住图像最外一圈像素
             self.setFixedSize(pixmap.width() + 2, pixmap.height() + 2)
         else:
-            self.setText(f"图片不在本地了\n{attachment.name}")
+            self.setText(f"本地文件已删除（服务器上还有）\n点一下取回 {attachment.name}"
+                         if attachment.recoverable
+                         else f"图片不在本地了\n{attachment.name}")
             self.setMinimumWidth(180)
             self.setWordWrap(True)
 
@@ -240,7 +266,7 @@ class ImageAttachmentView(QLabel):
     # ------------------------------------------------------------------ 事件
     def mousePressEvent(self, event) -> None:      # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            self.activated.emit("open")
+            self.activated.emit(self.VIEW_ACTION)
         super().mousePressEvent(event)
 
     def contextMenuEvent(self, event) -> None:     # noqa: N802
@@ -274,7 +300,9 @@ class FileAttachmentView(QFrame):
         self.meta_label = QLabel(attachment_meta(attachment), self)
         self.meta_label.setObjectName("fileMeta")
         if not attachment.exists:
-            self.meta_label.setText(f"{self.meta_label.text()} · 已不在本地")
+            self.meta_label.setText(
+                f"{self.meta_label.text()} · 本地已删除（点一下取回）"
+                if attachment.recoverable else f"{self.meta_label.text()} · 已不在本地")
 
         text_column = QVBoxLayout()
         text_column.setSpacing(3)

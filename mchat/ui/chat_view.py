@@ -308,7 +308,7 @@ class MessageBubble(QFrame):
 
     menuRequested = pyqtSignal(str, object)     # (message_id, 全局坐标)
     reactionToggled = pyqtSignal(str, str)      # (message_id, emoji)
-    attachmentRequested = pyqtSignal(str, str)  # (message_id, "open" / "folder")
+    attachmentRequested = pyqtSignal(str, str)  # (message_id, "view" / "open" / "folder")
     quoteTapped = pyqtSignal(str)               # 点了引用块：跳到被引用的那条
     mergedOpened = pyqtSignal(str)              # 点了合并转发卡片（开"聊天记录"窗口）
     selectionToggled = pyqtSignal(str)          # 批量选择模式下点了这条
@@ -1981,7 +1981,14 @@ class ChatView(QWidget):
         menu.addAction("选择", lambda: self.begin_selection(message_id))
         if bubble.has_attachment():
             menu.addSeparator()
-            name = bubble.attachment.name if bubble.attachment else "附件"
+            attachment = bubble.attachment
+            name = attachment.name if attachment else "附件"
+            if attachment is not None and attachment.kind == "image":
+                # 图片给两条路：**在应用里看大图**（点缩略图就是这个，QQ 那种）和
+                # **交给系统看图器**。还在服务器上的图也能先点（会先下载、下完自动打开）。
+                view = menu.addAction("查看图片",
+                                      lambda: self.attachmentRequested.emit(message_id, "view"))
+                view.setEnabled(bool(attachment.exists or attachment.is_remote))
             opened = menu.addAction(f"打开「{name}」",
                                     lambda: self.attachmentRequested.emit(message_id, "open"))
             opened.setEnabled(bool(bubble.attachment and bubble.attachment.exists))

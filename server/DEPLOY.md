@@ -14,7 +14,9 @@
 客户端 ──https://chat.example.com──> nginx ──http://127.0.0.1:8765──> mchat_server.py
                                                                             │
                                                              /var/lib/mchat/mchat.db
-                                                             /var/lib/mchat/files/<附件id>
+                                                             /var/lib/mchat/files/<内容哈希>
+                                                             （同一份文件只存一份；
+                                                              老数据在启动时自动归位，不改名）
 ```
 
 服务端只监听 127.0.0.1（不暴露 8765），HTTPS 由 nginx 终结 —— 这是最关键的一条：

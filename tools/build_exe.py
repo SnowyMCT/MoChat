@@ -128,6 +128,27 @@ def verify_bundle(expected: int) -> None:
     print(f"  OK  包里素材核对通过：{len(bundled)} 个文件（含 flags.png）")
 
 
+def sync_alias() -> None:
+    """把新 exe 顺手同步一份到 ``dist/MChat.exe``（用户在用的那个名字）。
+
+    为什么要有这一步：``main.spec`` 的产物叫 ``main.exe``（脚本、清单、打包核对都按这个
+    名字来），但实际双击启动的是 ``dist/MChat.exe``（早期打包时改的名）。不同步的话，
+    "重建完了"用户打开的还是旧程序 —— 这类"改了却没生效"最难发现。
+    只在这份文件已经存在时才同步（没这个别名就不多造一个），被占用时只提示、不算失败。
+    """
+    fresh = os.path.join(ROOT, "dist", "main.exe")
+    alias = os.path.join(ROOT, "dist", "MChat.exe")
+    if not (os.path.isfile(fresh) and os.path.isfile(alias)):
+        return
+    try:
+        shutil.copyfile(fresh, alias)
+    except OSError as error:
+        print(f"  [!] {os.path.relpath(alias, ROOT)} 没同步成功（{error}）—— "
+              f"关掉正在运行的客户端后手动拷一次，否则打开的还是旧程序")
+        return
+    print(f"  已同步到 {os.path.relpath(alias, ROOT)}（你平时启动的那个名字）")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="打包 MChat 为单文件 exe（带旗帜素材）")
     parser.add_argument("--clean", action="store_true", help="先删 build/ 缓存再打")
@@ -141,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     build(command, clean=args.clean)
     print("[4/4] 核对包里素材")
     verify_bundle(expected)
+    sync_alias()
 
     target = os.path.join(ROOT, "dist", "main.exe")
     size = os.path.getsize(target) / (1024 * 1024) if os.path.isfile(target) else 0.0

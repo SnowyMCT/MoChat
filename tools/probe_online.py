@@ -1,8 +1,8 @@
-"""真机启动验证 + 截图：登录窗口 → 注册 → 空主窗口 → 新建会话窗口。
+"""真机启动验证 + 截图：登录窗口 → 注册 → 空主窗口 → 新建群聊窗口。
 
 跑法（自己会起一个真服务端）：
     .venv/Scripts/python.exe tools/probe_online.py
-截图落在 artifacts/ 下，供人工/视觉复核新界面（登录、空列表、新建会话）。
+截图落在 artifacts/ 下，供人工/视觉复核新界面（登录、空列表、新建群聊）。
 """
 from __future__ import annotations
 
@@ -109,19 +109,16 @@ def main() -> int:
         window.set_theme("亮色")
         pump(app, 600)
 
-        # ---- 3. 新建会话窗口（搜人 + 建群）----
+        # ---- 3. 新建群聊窗口（搜人 + 勾人 + 建群）----
         other = ApiClient(server.base_url)
         other.register("probe_bob", PASSWORD, "鲍勃")
         dialog = window.open_new_chat()
         dialog.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
         dialog.show()
-        dialog.set_mode("找人聊天")
         dialog.set_keyword("probe_bob")
         dialog.run_search()
         pump(app, 2000)
         print("  ok    搜到人：", list(dialog.rows()), "|", dialog.status_text())
-        shoot(dialog, "online_new_chat.png")
-        dialog.set_mode("新建群聊")
         dialog.title_field.setText("评审组")
         dialog.toggle_member("probe_bob")
         pump(app, 300)

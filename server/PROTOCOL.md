@@ -339,13 +339,28 @@ POST /api/friends/remove    (auth)  {"username": "bob"}
 
 ```
 POST /api/upload?name=<urlencoded 文件名>      (auth, body = 原始字节)
-→ 200 {"attachment": Attachment}                // 超过限制 → 413 too_large
+→ 200 {"attachment": Attachment, "deduped": false}
+                                                 // 超过限制 → 413 too_large
                                                  // 超过账号配额 → 413 quota_exceeded
 
 GET  /api/files/<attachment_id>                (auth: Authorization 头)
 → 200 原始字节（Content-Type 按后缀猜，Content-Disposition: attachment; filename*=UTF-8''…）
    * 只有"上传者本人"或"引用它的那条消息所在会话的成员"能下载，否则 403 not_member
 ```
+
+**同一份内容在服务端只存一份**（内容寻址去重，`deduped: true` 就是"这次传的字节
+服务端早就有了，没再占空间"）。要点：
+
+* 每次上传仍然**各返回一个新的附件 id**，各自带自己那次的文件名 —— 去重的是磁盘上的
+  字节，不是"附件记录"：名字、属主、上传时间都是每次各自的，"只能引用自己上传的附件"
+  那道校验（§3.4）和"这份算谁的配额"因此照旧成立。客户端**不需要为它改任何代码**
+  （多出来的 `deduped` 字段可以无视）。
+* 配额（`--user-quota-mb`）按**内容**算：同一份内容重复上传不重复计费，也不会因为
+  "服务端已经有这份内容"而把你卡住。
+* 老库/老数据在服务端第一次启动时自动归位（算出内容哈希、登记去重表），
+  老文件不改名 —— 对客户端完全透明。
+* 回收规则：没有任何消息引用的附件放够 `--orphan-days` 天会被删；**只有这份内容再
+  没有任何附件引用时**才连磁盘字节一起删（别人还在用的那份绝不会被误删）。
 
 **文件名会被服务端洗一遍**（`?name=` 是发送者说了算的）：只留最后一段（去掉 `/` 和 `\`）、
 去掉 CR/LF 等控制字符、截到 120 字符。因为这个名字会出现在两个危险的地方 ——

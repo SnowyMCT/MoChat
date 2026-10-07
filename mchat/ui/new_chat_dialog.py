@@ -1,13 +1,14 @@
-"""新建会话窗口：找到人开聊 / 拉个群。
+"""新建群聊窗口：搜人 → 勾人 → 建群。
 
-真实的聊天软件不能只有"演示里那几个现成的会话" —— 用户得能自己找人。这个窗口给两条路：
+这里**只建群**。「找人开聊」那条路已经删掉了：和某个人开始一段会话现在走
+「好友」窗口（左栏那个两个人图标）的「搜索 → 加好友 → 对方同意」—— 服务端在
+同意的那一刻就把单聊建好、推给两边，所以「＋」里再放一个\"搜到名字就直接开单聊\"
+只会变成第二套加好友的路子（而且它不需要对方验证），留着就是两套语义打架。
 
-* **找人聊天**：按用户名或昵称搜（服务端 ``/api/users``），点一下就在服务端建一个单聊
-  （幂等：之前聊过就带你回原来的那个会话，不会在两边各留一个空壳）；
-* **新建群聊**：填群名 + 勾几个人（同样靠搜索），一次建好，自己是群主。
+群聊跟好友关系无关（拉谁进来都行），所以这一条原样保留。
 
 窗口是**固定尺寸**的小窗口（和项目里其它小窗一致：``setFixedSize`` + 原生
-"不可拉伸"窗口标志，只设前者 Windows 上边框仍会出现双向箭头）。搜索走防抖 250ms，
+\"不可拉伸\"窗口标志，只设前者 Windows 上边框仍会出现双向箭头）。搜索走防抖 250ms，
 所有网络调用都在后台线程，窗口全程可拖动。
 """
 from __future__ import annotations
@@ -21,20 +22,22 @@ from ..core.api import ApiError, NetworkError
 from .async_call import AsyncCall
 from .avatar import Avatar
 from .theme import Palette, build_qss
-from .widgets import FloatingLabelInput, SegmentedControl
+from .widgets import FloatingLabelInput
 
-__all__ = ["NewChatDialog", "UserRow", "MODE_DIRECT", "MODE_GROUP"]
+__all__ = ["NewChatDialog", "UserRow"]
 
-MODE_DIRECT = "找人聊天"
-MODE_GROUP = "新建群聊"
+TITLE = "新建群聊"
 DIALOG_W = 440
 DIALOG_H = 540
 ROW_H = 52
 SEARCH_DEBOUNCE_MS = 250
 
+#: 搜索框下方的提示（只有一种模式了，文案是固定的）。
+HINT = "勾几个人（可多选），填个群名，点「创建群聊」"
+
 
 class UserRow(QFrame):
-    """搜索结果里的一行：头像 + 昵称 + @用户名。整行可点（Telegram 的习惯）。"""
+    """搜索结果里的一行：头像 + 昵称 + @用户名。整行可点（点一下 = 勾选/取消）。"""
 
     clicked = pyqtSignal(str)                  # 用户名
 
@@ -70,7 +73,7 @@ class UserRow(QFrame):
         row.addWidget(self.mark)
 
     def set_selected(self, selected: bool) -> None:
-        """群聊模式下勾选（单聊模式下永远是 False，点了直接开聊）。"""
+        """勾选状态（整行高亮 + 右侧一个 ✓）。"""
         if selected == self._selected:
             return
         self._selected = bool(selected)
@@ -93,14 +96,14 @@ class UserRow(QFrame):
 
 
 class NewChatDialog(QDialog):
-    """找到人就能开聊的窗口。``conversationCreated`` 携带服务端返回的会话。"""
+    """建群窗口（勾人 + 群名）。``conversationCreated`` 携带服务端返回的会话。"""
 
     conversationCreated = pyqtSignal(object)
 
     def __init__(self, parent=None, *, api=None, theme_name: str = ""):
         super().__init__(parent)
         self.setObjectName("root")
-        self.setWindowTitle("新建会话")
+        self.setWindowTitle(TITLE)
         self.setFixedSize(DIALOG_W, DIALOG_H)
         # 只 setFixedSize 的话 Windows 边框还会给出双向箭头；这一条才是原生"拉不动"
         self.setWindowFlag(Qt.WindowType.MSWindowsFixedSizeDialogHint, True)
@@ -108,8 +111,8 @@ class NewChatDialog(QDialog):
         self._palette: Palette | None = None
         self._rows: dict[str, UserRow] = {}
         self._selected: list[str] = []
-        # 两条独立的通道：搜索和"建会话"分开 —— 共用一条的话，搜索还在飞的时候
-        # 点一行会被 `is_running()` 静默挡掉（用户会以为点了没反应）
+        # 两条独立的通道：搜索和"建群"分开 —— 共用一条的话，搜索还在飞的时候
+        # 点「创建群聊」会被 `is_running()` 静默挡掉（用户会以为点了没反应）
         self._search_call = AsyncCall(self)
         self._search_call.finished.connect(self._on_search_done)
         self._search_call.failed.connect(self._on_failed)
@@ -125,13 +128,10 @@ class NewChatDialog(QDialog):
 
     # ================================================================== 搭建
     def _build_ui(self) -> None:
-        self.title = QLabel("新建会话", self)
+        self.title = QLabel(TITLE, self)
         self.title.setObjectName("title")
-        self.subtitle = QLabel("搜到人就能开聊；群里可以一次选好几个人", self)
+        self.subtitle = QLabel("群里可以一次选好几个人；好友关系请用左栏的「好友」", self)
         self.subtitle.setObjectName("subtitle")
-
-        self.mode_seg = SegmentedControl([MODE_DIRECT, MODE_GROUP], height=34)
-        self.mode_seg.valueChanged.connect(self._on_mode_changed)
 
         self.search_field = FloatingLabelInput("搜索用户名或昵称", field_height=42)
         self.search_field.textChanged.connect(self._on_keyword)
@@ -149,28 +149,23 @@ class NewChatDialog(QDialog):
         self.rows_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.rows_area.setWidget(self.rows_host)
 
-        self.hint_label = QLabel("输入几个字就开始搜（用户名、昵称都能搜）", self)
+        self.hint_label = QLabel(HINT, self)
         self.hint_label.setObjectName("dialogHint")
         self.hint_label.setWordWrap(True)
         self.hint_label.setSizePolicy(QSizePolicy.Policy.Ignored,
                                       QSizePolicy.Policy.Preferred)
 
-        # ---- 建群那几件东西（切到「找人聊天」时整块藏起来）----
+        # ---- 建群那几件东西 ----
         self.title_field = FloatingLabelInput("群名称", field_height=42)
         self.picked_label = QLabel("还没选人", self)
         self.picked_label.setObjectName("dialogHint")
+        self.picked_label.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                        QSizePolicy.Policy.Preferred)
         self.create_btn = QPushButton("创建群聊", self)
         self.create_btn.setObjectName("primary")
         self.create_btn.setFixedHeight(40)
         self.create_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.create_btn.clicked.connect(self.create_group)
-        self.group_box = QWidget(self)
-        group = QVBoxLayout(self.group_box)
-        group.setContentsMargins(0, 0, 0, 0)
-        group.setSpacing(8)
-        group.addWidget(self.title_field)
-        group.addWidget(self.picked_label)
-        group.addWidget(self.create_btn)
 
         self.status_label = QLabel("", self)
         self.status_label.setObjectName("dialogStatus")
@@ -193,33 +188,15 @@ class NewChatDialog(QDialog):
         box.setSpacing(10)
         box.addLayout(head)
         box.addWidget(self.subtitle)
-        box.addWidget(self.mode_seg)
-        box.addWidget(self.group_box)
+        box.addWidget(self.title_field)
+        box.addWidget(self.picked_label)
         box.addWidget(self.search_field)
         box.addWidget(self.hint_label)
         box.addWidget(self.rows_area, 1)
+        box.addWidget(self.create_btn)
         box.addWidget(self.status_label)
-        self._on_mode_changed(MODE_DIRECT)
 
     # ================================================================== 状态
-    def mode(self) -> str:
-        return self.mode_seg.value()
-
-    def set_mode(self, mode: str) -> None:
-        if mode in (MODE_DIRECT, MODE_GROUP):
-            self.mode_seg.set_index([MODE_DIRECT, MODE_GROUP].index(mode), notify=False)
-            self._on_mode_changed(mode)
-
-    def _on_mode_changed(self, mode: str) -> None:
-        building = mode == MODE_GROUP
-        self.group_box.setVisible(building)
-        self.hint_label.setText(
-            "勾几个人（可多选），填个群名，点「创建群聊」" if building
-            else "输入几个字就开始搜（用户名、昵称都能搜）")
-        for row in self._rows.values():
-            row.set_selected(row.username in self._selected if building else False)
-        self.set_status("", "info")
-
     def status_text(self) -> str:
         return self.status_label.text()
 
@@ -280,8 +257,8 @@ class NewChatDialog(QDialog):
             if not username:
                 continue
             row = UserRow(user, self.rows_host)
-            row.clicked.connect(self.choose_user)
-            row.set_selected(username in self._selected and self.mode() == MODE_GROUP)
+            row.clicked.connect(self.toggle_member)      # 点一行 = 勾上/取消
+            row.set_selected(username in self._selected)
             if self._palette is not None:
                 row.apply_palette(self._palette)
             row.show()
@@ -289,22 +266,8 @@ class NewChatDialog(QDialog):
             self._rows[username] = row
 
     # ================================================================== 动作
-    def choose_user(self, username: str) -> None:
-        """点一行：群聊模式下是勾选，单聊模式下是直接开聊。"""
-        if self.mode() == MODE_GROUP:
-            self.toggle_member(username)
-            return
-        if self._api is None or self._act_call.is_running():
-            return
-
-        def work():
-            return {"conversation": self._api.create_direct(username)}
-
-        if not self._act_call.run(work):
-            return
-        self.set_status(f"正在打开和 {username} 的会话…", "info")
-
     def toggle_member(self, username: str) -> bool:
+        """勾上/取消一个人（点搜索结果那一行走的就是这里）。"""
         if username in self._selected:
             self._selected.remove(username)
             picked = False
@@ -345,20 +308,18 @@ class NewChatDialog(QDialog):
 
     # ================================================================== 回调
     def _on_search_done(self, result) -> None:
-        """搜索回来了：铺结果行（``_fill_rows`` 会按当前模式决定要不要勾选）。"""
+        """搜索回来了：铺结果行。"""
         payload = dict(result or {})
         users = list(payload.get("users") or [])
         self._fill_rows(users)
         keyword = self.search_field.text().strip()
         if users:
-            self.set_status(f"找到 {len(users)} 个人"
-                            + ("" if self.mode() == MODE_GROUP else "，点一下开聊"),
-                            "success")
+            self.set_status(f"找到 {len(users)} 个人，点一下勾选", "success")
         else:
             self.set_status(f"没找到「{keyword}」——用户名要完全一样的几个字符", "info")
 
     def _on_done(self, result) -> None:
-        """建会话回来了：把服务端给的会话抛出去、关窗。"""
+        """建群回来了：把服务端给的会话抛出去、关窗。"""
         conversation = dict((result or {}).get("conversation") or {})
         if not conversation.get("id"):
             self.set_status("服务端没返回会话", "error")
@@ -387,7 +348,6 @@ class NewChatDialog(QDialog):
         self.setStyleSheet(build_qss(palette))
         self.search_field.apply_palette(palette)
         self.title_field.apply_palette(palette)
-        self.mode_seg.apply_palette(palette)
         self.subtitle.setStyleSheet(f"color: {palette.muted};")
         for row in self._rows.values():
             row.apply_palette(palette)

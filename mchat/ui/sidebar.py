@@ -280,7 +280,7 @@ class Sidebar(QWidget):
     conversationMenuRequested = pyqtSignal(str, object)   # (会话id, 全局坐标)
     toolRequested = pyqtSignal()
     settingsRequested = pyqtSignal()                      # 点齿轮：开设置区域
-    newChatRequested = pyqtSignal()                       # 点「＋」：找人聊天 / 建群
+    newChatRequested = pyqtSignal()                       # 点「＋」：新建群聊
     friendsRequested = pyqtSignal()                       # 点好友图标：好友 / 申请 / 加好友
     logoutRequested = pyqtSignal()                        # 点「退出」：回登录界面
     themeChanged = pyqtSignal(str)
@@ -328,8 +328,9 @@ class Sidebar(QWidget):
         self.tool_btn.setMinimumHeight(30)
         self.tool_btn.clicked.connect(self.toolRequested)
 
-        # 新建会话：联网版最常用的按钮（找人开聊），放在最顺手的位置
-        self.new_chat_btn = IconButton("plus", self, tooltip="新建会话：找人聊天 / 建个群")
+        # 新建群聊：找人不在这里（和某人开聊要走「好友」窗口的申请/同意），
+        # 这个按钮只管"一次把好几个人拉进来说话"
+        self.new_chat_btn = IconButton("plus", self, tooltip="新建群聊：勾几个人建个群")
         self.new_chat_btn.clicked.connect(self.newChatRequested)
 
         # 设置入口：主题 / 文字大小 / 动效都收在那一个窗口里（Ctrl+, 同效）

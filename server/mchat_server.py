@@ -26,7 +26,9 @@
     <data>/mchat.db         SQLite 数据库（账号 / 会话 / 消息 / token / 附件元信息）
     <data>/mchat.db-wal     SQLite 预写日志（运行时存在，正常退出会合并）
     <data>/mchat.db-shm
-    <data>/files/<id>       上传的附件原始字节
+    <data>/files/<blob>     上传的附件原始字节，**按内容存一份**（<blob> 是内容的
+                            sha256，"b" + 64 位 hex）；同一份文件被谁上传几次都只
+                            占这一份空间。老数据仍是 <data>/files/<附件id>，照样能读。
 
 **备份只需要备份整个 data 目录**（或者停服后只备份 mchat.db 和 files/）。
 
@@ -164,6 +166,22 @@ def clipping(text, limit):
     """把字符串砍到 limit 个字符（用于引用预览、合并转发这类展示字段）。"""
     value = str(text or "")
     return value if len(value) <= limit else value[:limit]
+
+
+# ---------------------------------------------------------------------------
+# 附件去重（内容寻址）
+# ---------------------------------------------------------------------------
+BLOB_PREFIX = "b"        # 磁盘上按内容存的文件名前缀（b + sha256，一眼能和老的 f_ 附件 id 区分）
+
+
+def content_hash(blob):
+    """字节内容的 sha256（去重键）。
+
+    为什么是**明文**的哈希而不是磁盘上那份密文的：附件是加密落盘的，每次加密的 nonce
+    都不一样 —— 拿密文算哈希，"同一张图传两次"会算出两个值，去重直接失效。
+    所以先拿原始字节算，服务端不额外留明文副本（算完就扔）。
+    """
+    return hashlib.sha256(blob).hexdigest()
 
 
 class RateLimiter(object):
@@ -515,6 +533,21 @@ CREATE TABLE IF NOT EXISTS attachments (
   owner_id TEXT NOT NULL,
   name TEXT NOT NULL,
   size INTEGER NOT NULL,
+  created_at REAL NOT NULL,
+  -- 字节内容的 sha256（去重用）。为空 = 还没有归位的老数据（文件名还是附件 id）
+  content_hash TEXT
+);
+
+-- 附件的**字节**按内容寻址：一份内容只有一行、只在磁盘上占一份空间。
+-- 为什么不让 attachments 直接复用彼此的 id：附件的名字/属主/上传时间是**每次上传各自**的
+-- （去重的是字节，不是"这条附件记录"）—— 共用一个 id 会把"谁上传的、叫什么名字、
+-- 算谁的配额"全糊在一起，还会撞上 post_message 里"只能引用自己上传的附件"那道 IDOR 校验。
+-- path 是磁盘上的文件名：新数据是 "b"+sha256，从老版本迁移过来的是那个时候的附件 id
+-- （文件原地不动，不为了好看去改名）。
+CREATE TABLE IF NOT EXISTS blobs (
+  hash TEXT PRIMARY KEY,
+  size INTEGER NOT NULL,
+  path TEXT NOT NULL,
   created_at REAL NOT NULL
 );
 
@@ -600,10 +633,24 @@ class Database(object):
     def _setup(self):
         conn = self.conn
         conn.executescript(SCHEMA)
+        # 附件去重那一列是后加的：老库靠 CREATE TABLE IF NOT EXISTS 补不上，显式补。
+        # 用 table_xinfo 而不是 user_version（表结构演进走"能补就补"的路子，不锁版本号）。
+        self._ensure_column(conn, "attachments", "content_hash", "TEXT")
         self._migrate_tokens(conn)
         # 必须在**建表之后、开始服务之前**跑：门禁上线后，老库里已有的单聊
         # 如果没被追认成好友，两个人会在升级后突然发不出消息。
         self.migrated_friend_pairs = self._migrate_friends(conn)
+
+    @staticmethod
+    def _ensure_column(conn, table, column, ddl):
+        """老库补列（缺失才 ALTER，重复执行安全）。
+
+        ``PRAGMA table_info`` **不列生成列**，对生成列会误判"不存在"从而反复 ALTER
+        报 duplicate column —— 所以用 ``table_xinfo``。
+        """
+        columns = {row["name"] for row in conn.execute("PRAGMA table_xinfo(%s)" % table)}
+        if column not in columns:
+            conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, ddl))
 
     def _migrate_friends(self, conn):
         """把**存量单聊**的双方一次性追认成互为好友（INSERT OR IGNORE，幂等）。
@@ -887,8 +934,17 @@ class App(object):
                 conn.execute("UPDATE attachments SET name=? WHERE id=?",
                              (storage.encrypt_text(row["name"]), row["id"]))
                 changed += 1
-        for row in self.db.query("SELECT id FROM attachments"):
-            path = os.path.join(self.cfg.files_dir, row["id"])
+        # 附件字节：直接扫 files/ 目录，而不是"按附件记录一条条找"。去重之后
+        # 一份内容只对应一个文件（文件名是内容哈希，不再是附件 id），扫描既不用去重、
+        # 也顺带覆盖"上传到一半没登记成附件"的残留字节。
+        try:
+            names = os.listdir(self.cfg.files_dir)
+        except OSError:
+            names = []
+        for leaf in sorted(names):
+            if leaf.endswith(".part") or leaf.endswith(".enc"):
+                continue                     # 落地中的临时文件不碰
+            path = os.path.join(self.cfg.files_dir, leaf)
             if not os.path.isfile(path):
                 continue
             with open(path, "rb") as handle:
@@ -1966,22 +2022,50 @@ class App(object):
 
     # ---------------- 附件 ----------------
     def used_bytes(self, user_id):
-        """这个账号的附件一共占了多少字节。"""
+        """这个账号的附件一共占了多少字节（**同一份内容只算一次**）。
+
+        去重之后"同一张图传两次"在服务端只占一份空间，配额也该只收一次钱 ——
+        否则用户会看到"我明明只发了一张图，配额却掉了两倍"。老数据（``content_hash``
+        为空）没有内容可比，就按"每条各自一份"算：拿附件 id 造一个不会重复的分组键。
+        """
         return int(self.db.scalar(
-            "SELECT COALESCE(SUM(size), 0) FROM attachments WHERE owner_id=?", (user_id,),
+            "SELECT COALESCE(SUM(size), 0) FROM ("
+            "  SELECT MAX(size) AS size FROM attachments WHERE owner_id=?"
+            "  GROUP BY COALESCE(NULLIF(content_hash, ''), 'legacy:' || id))",
+            (user_id,),
             default=0) or 0)
 
-    def save_upload(self, me, name, blob):
-        # 名字是发送者给的，会原样进 Content-Disposition 和客户端的落地路径 —— 先洗干净
-        name = safe_filename(name)
-        quota = int(self.cfg.user_quota_mb * 1048576)
-        if quota > 0:
-            used = self.used_bytes(me["id"])
-            if used + len(blob) > quota:
-                fail("quota_exceeded", "你的附件配额已满（上限 %.0f MB，已用 %.1f MB）"
-                     % (self.cfg.user_quota_mb, used / 1048576.0))
-        att_id = self._new_id("f_", "attachments")
-        path = os.path.join(self.cfg.files_dir, att_id)
+    def blob_path(self, att_id, content_hash=""):
+        """附件字节在磁盘上的位置。
+
+        * 有 ``content_hash`` 且 blobs 里有登记 → ``files/<blob.path>``（新数据是
+          ``b<sha256>``，从老版本归位过来的是当时的附件 id）；
+        * 否则退回老规矩 ``files/<附件id>``。
+
+        path 是服务端自己写进库的，但**落到磁盘前再确认一次**它不带目录分隔符 ——
+        库被外部改过时不至于让它指到 ``files/`` 外面去。
+        """
+        if content_hash:
+            row = self.db.query_one("SELECT path FROM blobs WHERE hash=?", (content_hash,))
+            if row is not None:
+                leaf = str(row["path"] or "")
+                if leaf and os.path.basename(leaf) == leaf:
+                    return os.path.join(self.cfg.files_dir, leaf)
+        return os.path.join(self.cfg.files_dir, att_id)
+
+    def _put_blob(self, digest, blob):
+        """把附件字节落到 ``files/`` 并登记到 blobs；**已经有这份内容就直接复用**。
+
+        返回 True = 复用了磁盘上已有的字节（这次没写盘，空间没涨）。
+        """
+        existing = self.db.query_one("SELECT path FROM blobs WHERE hash=?", (digest,))
+        if existing is not None:
+            leaf = str(existing["path"] or "")
+            if leaf and os.path.basename(leaf) == leaf \
+                    and os.path.isfile(os.path.join(self.cfg.files_dir, leaf)):
+                return True
+        leaf = BLOB_PREFIX + digest                 # 内容寻址：文件名就是内容的哈希
+        path = os.path.join(self.cfg.files_dir, leaf)
         tmp = path + ".part"
         # 附件字节也加密落盘（size 列存的仍是原始大小，客户端看到的"文件多大"不变）
         payload = self.storage.encrypt_bytes(blob) if self.storage.available else blob
@@ -1989,36 +2073,139 @@ class App(object):
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        now = now_ts()
+        os.replace(tmp, path)                       # 半截文件绝不落在正式路径上
+        # 字节丢了/被清掉的极端情况：这次重写之后把登记改回可用路径（自愈）
         self.db.execute(
-            "INSERT INTO attachments(id, owner_id, name, size, created_at) VALUES(?,?,?,?,?)",
-            (att_id, me["id"], self._seal(name), len(blob), now),
+            "INSERT INTO blobs(hash, size, path, created_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(hash) DO UPDATE SET size=excluded.size, path=excluded.path",
+            (digest, len(blob), leaf, now_ts()),
         )
-        return {"id": att_id, "name": name, "size": len(blob)}
+        return False
+
+    def migrate_attachment_blobs(self):
+        """老数据归位：算出每条附件的内容哈希、登记 blobs，并回收重复的字节。
+
+        为什么要有这一步：去重靠 ``content_hash``，老库里这一列是空的 —— 不补的话
+        "我发过的图，别人再发一遍"仍然会各存一份。归位之后新旧数据一视同仁。
+
+        幂等（只处理 content_hash 为空的行），老文件**不改名、原地不动**。
+        返回 ``(归位的条数, 回收掉的重复文件数)``。
+        """
+        migrated = 0
+        reclaimed = 0
+        rows = self.db.query(
+            "SELECT id, created_at FROM attachments "
+            "WHERE content_hash IS NULL OR content_hash='' ORDER BY created_at, id")
+        for row in rows:
+            path = os.path.join(self.cfg.files_dir, row["id"])
+            if not os.path.isfile(path):
+                continue      # 字节本来就丢了：留着空值，下载时照旧报"附件文件已丢失"
+            with open(path, "rb") as handle:
+                raw = handle.read()
+            try:
+                blob = self.storage.decrypt_bytes(raw)
+            except StorageKeyError:
+                # 密钥不对（换了 key 文件/拷了别的机器的数据）：宁可不动，
+                # 也不能把库改成"指向一份解不开的字节"
+                continue
+            digest = content_hash(blob)
+            existing = self.db.query_one("SELECT path FROM blobs WHERE hash=?", (digest,))
+            self.db.execute(
+                "INSERT OR IGNORE INTO blobs(hash, size, path, created_at) VALUES(?,?,?,?)",
+                (digest, len(blob), row["id"], row["created_at"]))
+            self.db.execute("UPDATE attachments SET content_hash=? WHERE id=?",
+                            (digest, row["id"]))
+            migrated += 1
+            if existing is not None and str(existing["path"]) != row["id"]:
+                # 这份内容已经存在别的名字下了 → 这一份是重复的，删掉回收空间
+                try:
+                    os.remove(path)
+                    reclaimed += 1
+                except OSError:
+                    pass
+        return migrated, reclaimed
+
+    def cleanup_orphan_blobs(self):
+        """没有任何附件引用的字节（上传到一半崩了留下的）。幂等，返回删掉几个。"""
+        removed = 0
+        for row in self.db.query(
+                "SELECT hash FROM blobs WHERE NOT EXISTS "
+                "(SELECT 1 FROM attachments a WHERE a.content_hash = blobs.hash)"):
+            if self._drop_blob_if_unreferenced(row["hash"]):
+                removed += 1
+        return removed
+
+    def _drop_blob_if_unreferenced(self, digest):
+        """这一份内容再没人引用了，就把 blobs 行和磁盘上的字节一起删掉。"""
+        still = self.db.query_one(
+            "SELECT 1 FROM attachments WHERE content_hash=? LIMIT 1", (digest,))
+        if still is not None:
+            return False
+        row = self.db.query_one("SELECT path FROM blobs WHERE hash=?", (digest,))
+        self.db.execute("DELETE FROM blobs WHERE hash=?", (digest,))
+        if row is not None:
+            leaf = str(row["path"] or "")
+            if leaf and os.path.basename(leaf) == leaf:
+                try:
+                    os.remove(os.path.join(self.cfg.files_dir, leaf))
+                except OSError:
+                    pass
+        return True
+
+    def save_upload(self, me, name, blob):
+        # 名字是发送者给的，会原样进 Content-Disposition 和客户端的落地路径 —— 先洗干净
+        name = safe_filename(name)
+        digest = content_hash(blob)
+        known = self.db.query_one("SELECT 1 FROM blobs WHERE hash=?", (digest,))
+        quota = int(self.cfg.user_quota_mb * 1048576)
+        if quota > 0:
+            used = self.used_bytes(me["id"])
+            # 这份内容已经在服务端了（哪怕是别人先传的）→ 空间不会涨，别拿配额卡他
+            extra = 0 if known is not None else len(blob)
+            if used + extra > quota:
+                fail("quota_exceeded", "你的附件配额已满（上限 %.0f MB，已用 %.1f MB）"
+                     % (self.cfg.user_quota_mb, used / 1048576.0))
+        att_id = self._new_id("f_", "attachments")
+        reused = self._put_blob(digest, blob)
+        now = now_ts()
+        # 每次上传**各有一条附件记录**（名字/属主/时间都是各自的），去重的只是磁盘上的字节：
+        # 这样"只能引用自己上传的附件"那道 IDOR 校验、以及"这份算谁的配额"都还是对的。
+        self.db.execute(
+            "INSERT INTO attachments(id, owner_id, name, size, created_at, content_hash) "
+            "VALUES(?,?,?,?,?,?)",
+            (att_id, me["id"], self._seal(name), len(blob), now, digest),
+        )
+        return {"id": att_id, "name": name, "size": len(blob), "deduped": reused}
 
     def cleanup_orphan_attachments(self, days, limit=500):
         """清掉"上传了但没有任何消息引用"且放了超过 N 天的附件（数据库行 + 磁盘字节）。
 
         为什么需要：上传接口先落地文件、再由发消息引用；中途失败（客户端崩了、用户
         取消了）就会留下永远不会被引用的孤儿。没有回收的话磁盘只涨不跌。
-        返回清掉了几个。
+        去重之后还要多一步：字节是**按内容共享**的，删掉一条附件记录不等于能删文件 ——
+        只有当这份内容再没有任何附件引用时，才把 blobs 行和磁盘上的字节一起删掉；
+        否则会把别人还在用的那份图给删了（对方下载就变 404）。
+        返回清掉了几个附件。
         """
         if days <= 0:
             return 0
         deadline = now_ts() - days * 86400.0
         rows = self.db.query(
-            "SELECT id FROM attachments WHERE created_at < ? AND NOT EXISTS "
+            "SELECT id, content_hash FROM attachments WHERE created_at < ? AND NOT EXISTS "
             "(SELECT 1 FROM messages m WHERE m.attachment_id = attachments.id) LIMIT ?",
             (deadline, int(limit)),
         )
         removed = 0
         for row in rows:
             self.db.execute("DELETE FROM attachments WHERE id=?", (row["id"],))
-            try:
-                os.remove(os.path.join(self.cfg.files_dir, row["id"]))
-            except OSError:
-                pass
+            digest = row["content_hash"] or ""
+            if digest:
+                self._drop_blob_if_unreferenced(digest)
+            else:
+                try:                       # 老数据：文件名就是附件 id，直接删
+                    os.remove(os.path.join(self.cfg.files_dir, row["id"]))
+                except OSError:
+                    pass
             removed += 1
         return removed
 
@@ -2034,7 +2221,8 @@ class App(object):
             )
             if allowed is None:
                 fail("not_member", "你无权下载这个附件")
-        path = os.path.join(self.cfg.files_dir, att_id)
+        # 字节是内容寻址的（老数据回落到 files/<附件id>），由 blob_path 一处算出来
+        path = self.blob_path(row["id"], row["content_hash"] or "")
         if not os.path.isfile(path):
             fail("not_found", "附件文件已丢失")
         return row, path
@@ -2511,7 +2699,7 @@ def _presence_watcher(app, stop_event, interval=5.0):
 
 
 def _janitor(app, stop_event, interval=300.0):
-    """每 5 分钟收拾一次：过期 token + 没人引用的孤儿附件。"""
+    """每 5 分钟收拾一次：过期 token + 没人引用的孤儿附件/孤儿字节。"""
     db = app.db
     while not stop_event.wait(interval):
         try:
@@ -2519,8 +2707,11 @@ def _janitor(app, stop_event, interval=300.0):
                 cur = conn.execute("DELETE FROM tokens WHERE expires_at IS NOT NULL AND expires_at <= ?", (now_ts(),))
                 removed = cur.rowcount
             orphans = app.cleanup_orphan_attachments(app.cfg.orphan_days)
-            if (removed or orphans) and db.cfg.verbose:
-                sys.stderr.write("[mchat] 清理：过期 token %d 条，孤儿附件 %d 个\n" % (removed, orphans))
+            # 去重之后还会剩"传了一半没登记成附件"的字节（进程被杀等），一并收掉
+            stray = app.cleanup_orphan_blobs()
+            if (removed or orphans or stray) and db.cfg.verbose:
+                sys.stderr.write("[mchat] 清理：过期 token %d 条，孤儿附件 %d 个，孤儿字节 %d 份\n"
+                                 % (removed, orphans, stray))
                 sys.stderr.flush()
         except Exception:
             traceback.print_exc()
@@ -2605,6 +2796,16 @@ def main(argv=None):
     db = Database(cfg)
     bus = EventBus(db)
     app = App(db, bus, cfg)
+    # 老数据归位：给存量附件算出内容哈希并登记 blobs（幂等）—— 去重对老图同样生效。
+    # 必须**早于** reencrypt_plaintext：先归位再加密，重启后两边看到的是同一份索引。
+    try:
+        moved, reclaimed = app.migrate_attachment_blobs()
+        stray = app.cleanup_orphan_blobs()
+        if moved or reclaimed or stray:
+            print("[mchat] 附件去重索引：归位 %d 条，回收重复文件 %d 份，清理孤儿字节 %d 份"
+                  % (moved, reclaimed, stray), flush=True)
+    except Exception:
+        traceback.print_exc()
     # 启用磁盘加密后的第一次启动：把以前明文存下来的内容就地改写成密文
     try:
         converted = app.reencrypt_plaintext()
