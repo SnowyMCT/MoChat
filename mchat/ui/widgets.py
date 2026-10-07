@@ -1066,6 +1066,7 @@ def install_app_chrome(window, *, title: str = "", controls=CHROME_CLOSE) -> Win
     outer.setSpacing(0)
     outer.addWidget(chrome)
     outer.addWidget(content, 1)
+    outer.activate()        # 多了一层布局：立刻排一趟，别让调用方量到"还没排定"的几何
     return chrome
 
 

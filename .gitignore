@@ -22,3 +22,17 @@ server/data/
 
 # 编辑器（整个 IDE 目录都不进仓库，本地留着照常用）
 .idea/
+
+# 编辑器 / 系统垃圾
+.vscode/
+Thumbs.db
+desktop.ini
+*.swp
+
+# 本地运行产物/数据兜底（客户端数据在 %APPDATA%，这些只是防呆：
+# 万一哪天在仓库目录里跑出个库/日志，别被顺手提交上去）
+*.db
+*.sqlite3
+*.log
+.env
+sessions.json

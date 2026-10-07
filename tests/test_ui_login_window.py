@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import pytest
 
@@ -48,6 +49,21 @@ def app():
     return QApplication.instance() or QApplication([])
 
 
+def _pump(ms: int = 60) -> None:
+    """走一趟事件循环。
+
+    **为什么必须有**：窗口现在顶上有一条自绘标题条（无边框那套），根布局因此多了一层
+    （标题条 + 内容容器）。``layout().activate()`` 只把布局**算**出来，子控件的几何要过
+    一趟事件循环才真排定 —— 不 pump 就量，量到的是"还没排定"的中间态（实测字段间距
+    1/0/1 这种），看着像排版坏了，其实只是没排完。
+    """
+    application = QApplication.instance()
+    deadline = time.time() + ms / 1000.0
+    while time.time() < deadline:
+        application.processEvents()
+        time.sleep(0.005)
+
+
 def _window(tmp_path, mode=MODE_LOGIN, *, accounts=()):
     """搭一扇窗并**真的显示**（隐藏字段的量法不同：isVisible 会全是 False）。
 
@@ -63,6 +79,7 @@ def _window(tmp_path, mode=MODE_LOGIN, *, accounts=()):
     window._on_mode_changed(mode)      # set_mode 不发信号，这里显式重排
     window.show()
     window.layout().activate()
+    _pump()
     return window
 
 

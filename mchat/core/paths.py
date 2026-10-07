@@ -74,8 +74,8 @@ def safe_local_name(name, fallback: str = FALLBACK_NAME) -> str:
 def is_inside(folder: str, path: str) -> bool:
     """``path`` 是不是真的落在 ``folder`` 里面（相等不算，按 realpath 比）。
 
-    两端都过 :func:`os.path.normcase`：Windows 上它折大小写（`C:\\Users\\H'S\\…`
-    和 `c:\\users\\h's\\…` 是同一个地方）并把 `/` 统一成 `\\`；POSIX 上是恒等函数。
+    两端都过 :func:`os.path.normcase`：Windows 上它折大小写（`C:\\Users\\SOMEONE\\…`
+    和 `c:\\users\\someone\\…` 是同一个地方）并把 `/` 统一成 `\\`；POSIX 上是恒等函数。
     少了这一步，"校验包含关系"会误伤正常路径（实测过：QStandardPaths 给的应用目录
     大小写和 realpath 规范化后的结果不一致，于是附件永远下不下来）。
     """
