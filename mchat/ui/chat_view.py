@@ -1,6 +1,8 @@
 """右侧聊天区：消息气泡、日期分隔条、输入栏，以及"没选会话"的空态。"""
 from __future__ import annotations
 
+import os
+
 from PyQt6.QtCore import (QEvent, QPoint, QRect, QRectF, QSize, Qt, QTimer,
                           pyqtSignal)
 from PyQt6.QtGui import (QColor, QPainter, QPainterPath, QPalette, QPen,
@@ -22,7 +24,8 @@ from .theme import menu_qss
 
 __all__ = ["ChatView", "MessageList", "MessageBubble", "Composer",
            "ReactionChip", "QUICK_REACTIONS", "ReplyBar", "SelectionBar",
-           "SelectionCheck", "HitLayer", "QuoteBox", "MergedCard", "PinBanner"]
+           "SelectionCheck", "HitLayer", "QuoteBox", "MergedCard", "PinBanner",
+           "UploadProgress", "TransferProgress", "UnreadDivider", "local_file_paths"]
 
 MAX_BUBBLE_WIDTH = 520
 MIN_INPUT_LINES = 1
@@ -297,6 +300,114 @@ class DateChip(QLabel):
         return self.text()
 
 
+class TransferProgress(QWidget):
+    """气泡里附件下方那条传输进度：一根轨道 + 一根填充 + 一句状态。
+
+    上传和下载共用同一条线，只有措辞不同（``mode``）：上传失败是"正在重试"
+    （发件箱会自动退避重发，用户什么都不用做），下载失败是"点一下重试"
+    （下载不排队、不会自己重来，得用户再点一下）—— 文案必须和真行为一致。
+
+    为什么不用 ``QProgressBar``：它的默认外观要另配一整套 QSS（槽、块、文字对齐），
+    而这里只要"一根细线往前走"；自绘两段 QFrame 更短、跟着主题走也更容易。
+    """
+
+    TRACK_H = 4
+
+    def __init__(self, parent=None, *, mode: str = "upload"):
+        super().__init__(parent)
+        self.setObjectName("uploadBar")
+        self._mode = "download" if str(mode) == "download" else "upload"
+        self._value = 0.0
+        self._failed = False
+
+        self.track = QFrame(self)
+        self.track.setObjectName("uploadTrack")
+        self.track.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.fill = QFrame(self.track)
+        self.fill.setObjectName("uploadFill")
+        self.fill.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        self.label = QLabel("", self)
+        self.label.setObjectName("uploadText")
+
+        column = QVBoxLayout(self)
+        column.setContentsMargins(0, 4, 0, 0)
+        column.setSpacing(3)
+        column.addWidget(self.label)
+        column.addWidget(self.track)
+        self.hide()                        # 没有上传在进行时整块不存在
+
+    # ------------------------------------------------------------------ 对外
+    def verb(self) -> str:
+        """这条线在说的是"上传"还是"下载"（文案都从这里取，别处不许再拼一遍）。"""
+        return "下载" if self._mode == "download" else "上传"
+
+    def set_progress(self, value: float) -> None:
+        """更新进度（0~1）。"""
+        try:
+            self._value = max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return
+        self._failed = False
+        self.setProperty("state", "uploading")
+        self._repolish()
+        self.label.setText(f"{self.verb()}中 {int(round(self._value * 100))}%")
+        self.setVisible(True)
+        self._layout_fill()
+
+    def set_failed(self, reason: str = "") -> None:
+        """这一轮没成：整条变红 + 说清在等什么（上传会自动重发，下载得用户再点一下）。"""
+        self._failed = True
+        self._value = 0.0
+        self.setProperty("state", "failed")
+        self._repolish()
+        tail = "正在重试" if self._mode == "upload" else "点一下重试"
+        text = f"{self.verb()}失败，{tail}"
+        if reason:
+            text = f"{text}（{reason}）"
+        self.label.setText(text)
+        self.setVisible(True)
+        self._layout_fill()
+
+    def clear_state(self) -> None:
+        self._value = 0.0
+        self._failed = False
+        self.label.clear()
+        self.setVisible(False)
+
+    def progress_value(self) -> float:
+        return self._value
+
+    def state_text(self) -> str:
+        return self.label.text()
+
+    def is_failed(self) -> bool:
+        return self._failed
+
+    # ------------------------------------------------------------------ 内部
+    def resizeEvent(self, event) -> None:                  # noqa: N802
+        super().resizeEvent(event)
+        self._layout_fill()
+
+    def _layout_fill(self) -> None:
+        width = self.track.width()
+        self.track.setFixedHeight(self.TRACK_H)
+        filled = width if self._failed else int(width * self._value)
+        self.fill.setGeometry(0, 0, max(0, filled), self.TRACK_H)
+        self.label.setVisible(bool(self.label.text()))
+
+    def _repolish(self) -> None:
+        """动态属性改了必须 repolish，否则颜色不刷新（Qt 的老规矩）。"""
+        style = self.style()
+        if style is not None:
+            style.unpolish(self)
+            style.polish(self)
+
+
+#: 兼容旧名字：这条线最早只服务上传，后来下载也走它
+UploadProgress = TransferProgress
+
+
 class MessageBubble(QFrame):
     """一条消息的气泡：左侧（收到的）白/深底，右侧（发出的）主题浅色底。
 
@@ -312,6 +423,7 @@ class MessageBubble(QFrame):
     quoteTapped = pyqtSignal(str)               # 点了引用块：跳到被引用的那条
     mergedOpened = pyqtSignal(str)              # 点了合并转发卡片（开"聊天记录"窗口）
     selectionToggled = pyqtSignal(str)          # 批量选择模式下点了这条
+    linkActivated = pyqtSignal(str)             # 点了正文里的链接（主窗口交给系统浏览器）
 
     def __init__(self, message: Message, *, sender_name: str = "",
                  show_sender: bool = False, palette=None, parent=None):
@@ -348,6 +460,17 @@ class MessageBubble(QFrame):
         if self.attachment is not None:
             column.addWidget(self._build_attachment(self.attachment, palette))
 
+        # 附件传输进度：我发的走"上传"，别人发的还没取回来的走"下载"（同一条线，措辞不同）
+        self.upload: TransferProgress | None = None
+        self.download: TransferProgress | None = None
+        if self.attachment is not None:
+            if message.outgoing:
+                self.upload = TransferProgress(self)
+                column.addWidget(self.upload)
+            elif self.attachment.is_remote or self.attachment.recoverable:
+                self.download = TransferProgress(self, mode="download")
+                column.addWidget(self.download)
+
         self.merged_card: MergedCard | None = None
         if message.is_merged:                    # 合并转发：用卡片代替正文
             self.merged_card = MergedCard(message, self)
@@ -365,8 +488,15 @@ class MessageBubble(QFrame):
                                      else Qt.TextFormat.PlainText)
         self.text_label.setWordWrap(True)
         self.text_label.setMaximumWidth(MAX_BUBBLE_WIDTH - 26)
-        self.text_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._has_link = flag_text.contains_link(message.text)
+        flags = Qt.TextInteractionFlag.TextSelectableByMouse
+        if rich and self._has_link:
+            # 链接可点：**自己发信号**而不是 setOpenExternalLinks(True) —— 点开由主窗口
+            # 统一走系统浏览器（可注入、可测试、以后要加"确认再打开"也只改一处）。
+            flags |= Qt.TextInteractionFlag.LinksAccessibleByMouse
+            self.text_label.setOpenExternalLinks(False)
+            self.text_label.linkActivated.connect(self.linkActivated.emit)
+        self.text_label.setTextInteractionFlags(flags)
         if message.text:                      # 纯附件消息不用这一个空标签
             column.addWidget(self.text_label)
 
@@ -495,6 +625,46 @@ class MessageBubble(QFrame):
     def has_attachment(self) -> bool:
         return self.attachment is not None
 
+    # ------------------------------------------------------------ 上传进度
+    def set_upload_progress(self, value: float) -> bool:
+        """附件上传进度（0~1）。不是"我发的带附件消息"就返回 False（调用方无需管）。"""
+        if self.upload is None:
+            return False
+        self.upload.set_progress(value)
+        return True
+
+    def set_upload_failed(self, reason: str = "") -> bool:
+        """这一轮上传失败（发件箱会自动重试）：气泡上写清楚，别让用户干等。"""
+        if self.upload is None:
+            return False
+        self.upload.set_failed(reason)
+        return True
+
+    def clear_upload_state(self) -> None:
+        if self.upload is not None:
+            self.upload.clear_state()
+
+    def upload_text(self) -> str:
+        """上传进度那行字（测试断言用；没有进度条时是空串）。"""
+        return "" if self.upload is None else self.upload.state_text()
+
+    # ------------------------------------------------------------ 下载进度
+    def set_download_progress(self, value: float) -> bool:
+        """取回别人附件时的进度（0~1）。这条消息没有"待取回"的附件就返回 False。"""
+        if self.download is None:
+            return False
+        self.download.set_progress(value)
+        return True
+
+    def set_download_failed(self, reason: str = "") -> bool:
+        if self.download is None:
+            return False
+        self.download.set_failed(reason)
+        return True
+
+    def download_text(self) -> str:
+        return "" if self.download is None else self.download.state_text()
+
     def apply_palette(self, palette) -> None:
         """换主题时重画附件里"带颜色"的部分（文件图标）；图片是像素，不用动。"""
         if self.file_card is not None and palette is not None:
@@ -569,6 +739,18 @@ class MessageBubble(QFrame):
         self.menuRequested.emit(self.message_id, event.globalPos())
 
 
+def local_file_paths(mime) -> list[str]:
+    """从 ``QMimeData`` 里取出**确实存在的本地文件**路径（拖拽 / 资源管理器复制都是这个形状）。
+
+    只认真文件：拖网页图片、拖文件夹、拖一段文字过来都返回空列表 —— 调用方据此
+    放行给 Qt 默认处理（该插文字的插文字），不会把一次正常拖字变成"找不到文件"。
+    """
+    if mime is None or not mime.hasUrls():
+        return []
+    return [local for url in mime.urls()
+            if (local := url.toLocalFile()) and os.path.isfile(local)]
+
+
 class MessageEdit(QTextEdit):
     """聊天输入框：自增高 1~5 行，Enter 发送、Shift+Enter 换行，旗帜显示成图片。
 
@@ -581,10 +763,12 @@ class MessageEdit(QTextEdit):
 
     剪贴板里是**图片**（截图工具、从浏览器复制的图）时不往文档里塞，而是发
     :attr:`imagePasted` 信号 —— 图片要当成"附件"发出去，走的是和选文件同一条路。
+    拖进来的文件、从资源管理器复制来的文件同理，走 :attr:`filesDropped`。
     """
 
     submitted = pyqtSignal()
     imagePasted = pyqtSignal(object)         # QImage：从剪贴板粘进来的图片
+    filesDropped = pyqtSignal(list)          # 拖进来 / 粘进来的本地文件（路径列表）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -662,6 +846,10 @@ class MessageEdit(QTextEdit):
         **图片优先**：剪贴板里是一张图（截图、复制的图）时不当文字处理，交给
         :attr:`imagePasted` —— 由上层落成一个 PNG 文件再当附件发（Telegram 同款行为）。
         """
+        paths = local_file_paths(source)
+        if paths:
+            self.filesDropped.emit(paths)         # 资源管理器里复制来的文件：当附件发
+            return
         if source.hasImage():
             image = source.imageData()
             if image is not None and not image.isNull():
@@ -671,6 +859,32 @@ class MessageEdit(QTextEdit):
             self.insert_text(source.text())
             return
         super().insertFromMimeData(source)
+
+    # ------------------------------------------------------- 拖进来的文件
+    def dragEnterEvent(self, event) -> None:             # noqa: N802
+        """拖过来的**本地文件**归上层当附件（文字/图片仍按 Qt 默认处理）。
+
+        QTextEdit 自己默认接受拖放（拖文字进来就插字），所以必须在这一层拦：
+        输入框占了窗口正中一大块，不拦的话拖到这儿会被文本框吃掉。
+        """
+        if local_file_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:              # noqa: N802
+        if local_file_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:                  # noqa: N802
+        paths = local_file_paths(event.mimeData())
+        if paths:
+            event.acceptProposedAction()
+            self.filesDropped.emit(paths)
+            return
+        super().dropEvent(event)
 
     def keyPressEvent(self, event) -> None:              # noqa: N802
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -770,6 +984,7 @@ class Composer(QWidget):
     emojiPanelToggled = pyqtSignal(bool)     # 表情按钮自己只管状态，开哪个面板由聊天区决定
     attachRequested = pyqtSignal(str)        # 点了"图片"/"文件"：由主窗口弹文件选择框
     attachmentRemoved = pyqtSignal()         # 点了待发送条上的 ✕
+    filesDropped = pyqtSignal(list)          # 拖进来 / 粘进来的本地文件（路径列表）
     imagePasted = pyqtSignal(object)         # 输入框里粘进来一张图
     replyRemoved = pyqtSignal()              # 取消回复（点了回复条上的 ✕）
 
@@ -795,6 +1010,7 @@ class Composer(QWidget):
         self.edit = MessageEdit(self)
         self.edit.submitted.connect(self.submit)
         self.edit.imagePasted.connect(self.imagePasted)
+        self.edit.filesDropped.connect(self.filesDropped)
         self.send_btn = IconButton("send", self, size=18, box=42,
                                    tooltip="发送（Enter）", object_name="sendBtn")
         self.send_btn.clicked.connect(self.submit)
@@ -1078,6 +1294,38 @@ class PinBanner(QFrame):
         super().mouseReleaseEvent(event)
 
 
+class UnreadDivider(QFrame):
+    """「以下为 N 条新消息」的分隔线（Telegram 那条未读分界）。
+
+    只在**打开一个还有未读的会话**时插一条，位置在第一条未读消息之前。
+    插完就固定不动：用户在这条线上方翻历史时又来了新消息，也不会让分界乱跳。
+    """
+
+    def __init__(self, count: int = 0, parent=None):
+        super().__init__(parent)
+        self.setObjectName("unreadDivider")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._count = 0
+        self.label = QLabel(self)
+        self.label.setObjectName("unreadText")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(16, 6, 16, 6)
+        row.setSpacing(10)
+        row.addWidget(self.label)
+        self.set_count(count)
+
+    def set_count(self, count: int) -> None:
+        self._count = max(0, int(count))
+        self.label.setText(f"以下为 {self._count} 条新消息" if self._count else "以下为新消息")
+
+    def count(self) -> int:
+        return self._count
+
+    def text(self) -> str:
+        return self.label.text()
+
+
 class MessageList(QScrollArea):
     """消息区：按日期插分隔条，新消息追加后自动滚到底。"""
 
@@ -1090,6 +1338,7 @@ class MessageList(QScrollArea):
     mergedOpened = pyqtSignal(str)
     selectionModeChanged = pyqtSignal(bool)
     selectionChanged = pyqtSignal(int)          # 选了几条
+    linkActivated = pyqtSignal(str)             # 气泡正文里的链接被点了
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1142,13 +1391,66 @@ class MessageList(QScrollArea):
         self._chips.clear()
         self._selected.clear()
         self._last_day = ""
+        # 未读分隔线：只在"打开时还有未读"的会话里插一条，锚点是第一条未读消息
+        self._unread_anchor = ""
+        self._unread_count = 0
+        self._unread_divider: UnreadDivider | None = None
 
-    def set_conversation(self, conversation: Conversation) -> None:
+    def set_conversation(self, conversation: Conversation, *, unread: int = 0) -> None:
+        """铺开一个会话。``unread`` = 打开这一刻还有几条没看（主窗口从仓库拿）。
+
+        未读分隔线必须在**铺消息之前**就把锚点算好 —— 消息是一条条 append 的，
+        插在那条之前才有意义（插完再挪位置会连滚动位置一起跳）。
+        """
         self.clear_messages()
         self._group = conversation.is_group
+        self._unread_count = 0
+        self._unread_anchor = self._anchor_for(conversation, unread)
+        if self._unread_anchor:
+            self._unread_count = int(unread)
         for message in conversation.messages:
             self.append(message, conversation.sender_name(message), animate=False)
         self.scroll_to_bottom()
+
+    @staticmethod
+    def _anchor_for(conversation: Conversation, unread) -> str:
+        """第一条未读消息的 id；未读数为 0、或者数不清/超出条数时返回空串（不插线）。"""
+        try:
+            count = int(unread)
+        except (TypeError, ValueError):
+            return ""
+        messages = conversation.messages
+        if count <= 0 or count > len(messages):
+            return ""
+        return messages[len(messages) - count].id
+
+    def unread_anchor(self) -> str:
+        """未读分隔线插在哪条消息之前（空串 = 这条会话没有分隔线）。"""
+        return self._unread_anchor
+
+    def unread_divider(self) -> UnreadDivider | None:
+        return self._unread_divider
+
+    def has_unread_divider(self) -> bool:
+        return self._unread_divider is not None
+
+    def unread_divider_text(self) -> str:
+        divider = self._unread_divider
+        return "" if divider is None else divider.text()
+
+    def unread_divider_y(self) -> int:
+        """分隔线的纵坐标（-1 = 没有这条线）。测试据此断言"插在第一条未读之前"。"""
+        divider = self._unread_divider
+        if divider is None:
+            return -1
+        return divider.mapTo(self._host, QPoint(0, 0)).y()
+
+    def bubble_y(self, message_id: str) -> int:
+        """某条消息气泡的纵坐标（-1 = 这条不在列表里）。"""
+        bubble = self._bubbles.get(message_id)
+        if bubble is None:
+            return -1
+        return bubble.mapTo(self._host, QPoint(0, 0)).y()
 
     def append(self, message: Message, sender_name: str = "",
                animate: bool = True) -> MessageBubble:
@@ -1158,6 +1460,10 @@ class MessageList(QScrollArea):
             label = format_day_label(message.ts)
             self._chips.append(label)
             self._add_row(DateChip(label), center=True)
+        if self._unread_anchor and message.id == self._unread_anchor:
+            # 第一条未读之前插一条分界线（一天之内只会命中一次：锚点只有一个）
+            self._unread_divider = UnreadDivider(self._unread_count, self)
+            self._add_row(self._unread_divider, center=True)
         bubble = MessageBubble(message, sender_name=sender_name,
                                show_sender=self._group, palette=self._palette)
         bubble.menuRequested.connect(self.menuRequested)
@@ -1165,6 +1471,7 @@ class MessageList(QScrollArea):
         bubble.attachmentRequested.connect(self.attachmentRequested)
         bubble.quoteTapped.connect(self.quoteTapped)
         bubble.mergedOpened.connect(self.mergedOpened)
+        bubble.linkActivated.connect(self.linkActivated)
         bubble.selectionToggled.connect(self._on_bubble_clicked)
         if self._selection_mode:            # 选择模式下新到的消息也能被勾
             bubble.set_selection_mode(True)
@@ -1193,6 +1500,25 @@ class MessageList(QScrollArea):
 
     def has_message(self, message_id: str) -> bool:
         return message_id in self._bubbles
+
+    # ---------------------------------------------------------- 上传进度
+    def set_upload_progress(self, message_id: str, value: float) -> bool:
+        """把上传进度写到对应气泡上（这条不在本会话里就返回 False，调用方不用管）。"""
+        bubble = self._bubbles.get(message_id)
+        return bool(bubble is not None and bubble.set_upload_progress(value))
+
+    def set_upload_failed(self, message_id: str, reason: str = "") -> bool:
+        bubble = self._bubbles.get(message_id)
+        return bool(bubble is not None and bubble.set_upload_failed(reason))
+
+    def set_download_progress(self, message_id: str, value: float) -> bool:
+        """取回别人附件时的进度（这条不在本会话里就返回 False）。"""
+        bubble = self._bubbles.get(message_id)
+        return bool(bubble is not None and bubble.set_download_progress(value))
+
+    def set_download_failed(self, message_id: str, reason: str = "") -> bool:
+        bubble = self._bubbles.get(message_id)
+        return bool(bubble is not None and bubble.set_download_failed(reason))
 
     def bubble_count(self) -> int:
         return len(self._bubbles)
@@ -1548,6 +1874,7 @@ class ChatView(QWidget):
     attachRequested = pyqtSignal(str)        # 想选图片/文件（"image" / "file"）
     attachmentRequested = pyqtSignal(str, str)   # (message_id, "open" / "folder")
     imagePasted = pyqtSignal(object)         # 输入框里粘进来一张图（QImage）
+    filesDropped = pyqtSignal(list)          # 拖进来 / 粘进来的本地文件（路径列表）
     replyRequested = pyqtSignal(str)         # 右键菜单"回复"
     copyRequested = pyqtSignal(str)          # 右键菜单"复制"
     pinRequested = pyqtSignal(str)           # 右键菜单「置顶/取消置顶」
@@ -1558,6 +1885,7 @@ class ChatView(QWidget):
     selectionModeChanged = pyqtSignal(bool)  # 进出批量选择模式
     replyCleared = pyqtSignal()              # 用户点了回复条上的 ✕
     mergedOpened = pyqtSignal(str)           # 点了合并转发卡片：开"聊天记录"窗口
+    linkActivated = pyqtSignal(str)          # 点了气泡正文里的链接（主窗口交给系统浏览器）
 
     def __init__(self, store: ChatStore, parent=None, *, emoji_recents=()):
         super().__init__(parent)
@@ -1655,12 +1983,14 @@ class ChatView(QWidget):
         self.message_list.attachmentRequested.connect(self.attachmentRequested)
         self.message_list.quoteTapped.connect(self.quoteTapped)
         self.message_list.mergedOpened.connect(self.mergedOpened)
+        self.message_list.linkActivated.connect(self.linkActivated)
         self.message_list.selectionModeChanged.connect(self._on_selection_mode)
         self.message_list.selectionChanged.connect(self._on_selection_changed)
         self.composer = Composer(page)
         self.composer.messageSubmitted.connect(self.messageSubmitted)
         self.composer.attachRequested.connect(self.attachRequested)
         self.composer.imagePasted.connect(self.imagePasted)
+        self.composer.filesDropped.connect(self.filesDropped)
         # 待发送条上的 ✕：只清附件，不动输入框里的字
         self.composer.attachmentRemoved.connect(self._on_attachment_removed)
         self.composer.replyRemoved.connect(self.replyCleared)   # 回复条的 ✕ 直接转给主窗口
@@ -1708,7 +2038,8 @@ class ChatView(QWidget):
         self.status_label.setProperty("typing", "false")
         self.typing_dots.hide()
         self.typing_dots.stop()
-        self.message_list.set_conversation(conversation)
+        self.message_list.set_conversation(conversation,
+                                           unread=self._store.unread(conversation.id))
         self.stack.setCurrentIndex(1)
         self.header_avatar.show()            # 空态时收起来的头像，进来会话要放出来
         self.composer.edit.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -1854,6 +2185,31 @@ class ChatView(QWidget):
 
     def remove_message(self, message_id: str) -> bool:
         return self.message_list.remove_message(message_id)
+
+    # ------------------------------------------------------------ 上传进度
+    def set_upload_progress(self, message_id: str, value: float) -> bool:
+        """附件上传进度（主窗口从传输层收到进度事件后调这里）。"""
+        return self.message_list.set_upload_progress(message_id, value)
+
+    def set_upload_failed(self, message_id: str, reason: str = "") -> bool:
+        """这一轮上传失败：气泡上写"正在重试"（发件箱会自动退避重发）。"""
+        return self.message_list.set_upload_failed(message_id, reason)
+
+    def set_download_progress(self, message_id: str, value: float) -> bool:
+        """附件下载进度（取回别人发来的附件时，主窗口把后台线程的进度搬回来）。"""
+        return self.message_list.set_download_progress(message_id, value)
+
+    def set_download_failed(self, message_id: str, reason: str = "") -> bool:
+        """取回失败：气泡上写"点一下重试"（下载不排队，得用户再点一次）。"""
+        return self.message_list.set_download_failed(message_id, reason)
+
+    def download_text(self, message_id: str) -> str:
+        bubble = self.message_list.bubbles().get(message_id)
+        return "" if bubble is None else bubble.download_text()
+
+    def upload_text(self, message_id: str) -> str:
+        bubble = self.message_list.bubbles().get(message_id)
+        return "" if bubble is None else bubble.upload_text()
 
     def flash_message(self, message_id: str) -> bool:
         """滚到某条消息并闪一下（全局搜索跳转用）。"""

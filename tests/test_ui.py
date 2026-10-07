@@ -42,10 +42,11 @@ from mchat.ui import emoji, flags as flags_data                         # noqa: 
 from mchat.ui import main_window as main_window_module                  # noqa: E402
 from mchat.ui import theme as theme_module                              # noqa: E402
 from mchat.ui.icons import make_icon                                    # noqa: E402
+from mchat.ui.forward_dialog import FORWARD_HEIGHT, FORWARD_WIDTH      # noqa: E402
 from mchat.ui.main_window import MainWindow                             # noqa: E402
 from mchat.ui.pin_dialog import PinDialog                                # noqa: E402
 from mchat.ui.sidebar import SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH       # noqa: E402
-from mchat.ui.widgets import ToggleSwitch                              # noqa: E402
+from mchat.ui.widgets import CHROME_H, ToggleSwitch                    # noqa: E402
 from mchat.ui.theme import (THEME_DARK, THEME_LIGHT,                    # noqa: E402
                             THEME_OPTIONS)
 from ui_probe import (double_click_handle, drag_split_handle,           # noqa: E402
@@ -1057,8 +1058,8 @@ def main() -> int:
     # 断言"正在入场"不能靠"睡一小会儿再看"：机器忙的时候 pump 会超时，动画可能已经跑完
     # （实测偶发翻车一次）。show() 里是同步启动动画的，所以直接就查状态。
     check("打开时整窗在动（淡入 + 从下往上滑）", dialog.is_entering())
-    check("五张卡片（外观 / 动效 / 数据 / 关于 / 消息通知）",
-          dialog.card_count() == 5, str(dialog.card_count()))
+    check("六张卡片（外观 / 动效 / 数据 / 关于 / 消息通知 / 窗口行为）",
+          dialog.card_count() == 6, str(dialog.card_count()))
     check("入场结束后不留透明效果（稳态零开销）",
           wait_for(app, lambda: not dialog.is_entering()
                    and dialog.graphicsEffect() is None
@@ -1602,8 +1603,8 @@ def main() -> int:
           bool(dialog.windowFlags() & Qt.WindowType.MSWindowsFixedSizeDialogHint))
     dialog.resize(760, 340)                      # 模拟用户拖边框
     pump(app, 120)
-    check("拖了也拉不动：尺寸还是 420x520",
-          (dialog.width(), dialog.height()) == (420, 520),
+    check("拖了也拉不动：尺寸还是 420x520（外加顶上自绘标题条那一条）",
+          (dialog.width(), dialog.height()) == (FORWARD_WIDTH, FORWARD_HEIGHT + CHROME_H),
           f"{dialog.width()}x{dialog.height()}")
     check("所有会话行都在窗口里（右边/下边没有探出去的）",
           dialog.overflowing_rows() == [], str(dialog.overflowing_rows()))

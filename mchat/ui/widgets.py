@@ -16,8 +16,8 @@
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import (QEasingCurve, QEvent, QPoint, QPropertyAnimation, QRect,
-                          QSize, QTimer, Qt, pyqtProperty, pyqtSignal)
+from PyQt6.QtCore import (QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation,
+                          QRect, QSize, QTimer, Qt, pyqtProperty, pyqtSignal)
 from PyQt6.QtGui import QColor, QPen, QFont, QFontMetrics, QPainter, QPalette
 from PyQt6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
                              QLineEdit, QPlainTextEdit, QSizePolicy, QToolButton,
@@ -25,9 +25,12 @@ from PyQt6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel
 
 from . import anim
 from . import theme
+from .icons import IconButton
 
 __all__ = ["lerp", "mix_color", "FloatingLabelInput", "SegmentedControl", "ToggleSwitch",
-           "Toast", "CollapsibleSection", "SplitHandle", "confirm_destructive"]
+           "Toast", "CollapsibleSection", "SplitHandle", "confirm_destructive",
+           "WindowChrome", "install_app_chrome", "FramelessResizer", "CHROME_H",
+           "CHROME_CLOSE", "CHROME_WINDOW"]
 
 
 def confirm_destructive(parent, palette, *, title: str, text: str,
@@ -918,6 +921,298 @@ class CollapsibleSection(QWidget):
     def _on_height_done(self) -> None:
         if not self._expanded:
             self._inner.setVisible(False)
+
+
+# ---------------------------------------------------------------------------
+# 窗口自绘外壳（无边框 + 自绘标题条 + 八边缩放）
+# ---------------------------------------------------------------------------
+CHROME_H = 32                      # 自绘标题条的高度
+
+#: 普通对话框只留关闭；主窗口三个都要
+CHROME_CLOSE = ("close",)
+CHROME_WINDOW = ("minimize", "maximize", "close")
+
+_CHROME_ICONS = {"close": "win_close", "minimize": "win_minimize",
+                 "maximize": "win_maximize"}
+_CHROME_TIPS = {"close": "关闭", "minimize": "最小化", "maximize": "最大化"}
+
+
+class WindowChrome(QFrame):
+    """窗口自绘标题条：一条能拖的横杠 + 右边一排"最小化 / 最大化 / 关闭"。
+
+    为什么要它：应用内所有窗口都用**自绘的关闭按钮**，不要系统标题栏那套 ✕
+    （观感统一，配色也跟着主题走）。窗口因此是**无边框**的（``FramelessWindowHint``），
+    拖动和缩放得自己补：``startSystemMove()`` / ``startSystemResize()`` 在 Windows 上
+    走系统原生实现 —— Aero 贴边、双击最大化、Win+方向键都还在，不是"自己搬窗口"。
+
+    对话框不装最小化/最大化（它们本来就固定尺寸），只留一个 ✕。
+
+    尺寸**完全交给布局**（由 :func:`install_app_chrome` 摆进根布局第一格）。
+    注意这里**没有事件过滤器**跟窗口大小 —— 那是踩过坑的写法，见 install_app_chrome。
+    """
+
+    def __init__(self, window, *, title: str = "", controls=CHROME_CLOSE, parent=None):
+        super().__init__(parent if parent is not None else window)
+        self._window = window
+        self.setObjectName("chrome")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(CHROME_H)
+        self._palette = None
+        self.moves = 0                 # 拖动次数（测试用：验"拖动走的是系统原生那条路"）
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14, 0, 8, 0)
+        row.setSpacing(6)
+        self.title_label = QLabel(title, self)
+        self.title_label.setObjectName("chromeTitle")
+        self.title_label.setVisible(bool(title))
+        row.addWidget(self.title_label)
+        row.addStretch(1)
+
+        self.buttons: dict[str, IconButton] = {}
+        for name in controls:
+            button = IconButton(_CHROME_ICONS[name], self, size=11, box=28,
+                                tooltip=_CHROME_TIPS[name], object_name="chromeBtn")
+            button.clicked.connect(lambda _=False, action=name: self.trigger(action))
+            row.addWidget(button)
+            self.buttons[name] = button
+        if "close" in self.buttons:
+            self.buttons["close"].setObjectName("chromeCloseBtn")   # 悬停变色（见 QSS）
+
+    # ------------------------------------------------------------------ 对外
+    def title_text(self) -> str:
+        return self.title_label.text()
+
+    def button(self, name: str) -> IconButton | None:
+        return self.buttons.get(name)
+
+    def trigger(self, name: str) -> None:
+        """按钮动作。关 = ``window.close()``（主窗口那套"收进托盘"逻辑照旧拦得住）。"""
+        if name == "close":
+            self._window.close()
+        elif name == "minimize":
+            self._window.showMinimized()
+        elif name == "maximize":
+            self.toggle_maximized()
+
+    def toggle_maximized(self) -> None:
+        window = self._window
+        if window.isMaximized():
+            window.showNormal()
+        else:
+            window.showMaximized()
+        self.sync_maximize_button()
+
+    def sync_maximize_button(self) -> None:
+        """最大化/还原：同一个按钮换图标 + 换提示（系统标题栏也是这么做的）。"""
+        button = self.buttons.get("maximize")
+        if button is None:
+            return
+        maximized = bool(self._window.isMaximized())
+        button.set_icon_kind("win_restore" if maximized else "win_maximize")
+        button.setToolTip("还原" if maximized else "最大化")
+
+    def apply_palette(self, palette) -> None:
+        self._palette = palette
+        color = getattr(palette, "muted", "#8A93A3")
+        for button in self.buttons.values():
+            button.set_icon_color(color)
+        self.sync_maximize_button()
+
+    # ------------------------------------------------------------------ 事件
+    def mousePressEvent(self, event) -> None:            # noqa: N802
+        """按住标题条拖动：交给系统原生拖动（贴边/双击还原都还在）。"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            handle = self._window.windowHandle()
+            if handle is not None:
+                self.moves += 1
+                handle.startSystemMove()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:      # noqa: N802
+        if "maximize" in self.buttons and event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_maximized()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+def install_app_chrome(window, *, title: str = "", controls=CHROME_CLOSE) -> WindowChrome:
+    """给窗口装上"无边框 + 自绘标题条"，返回那个 chrome（调用方留着上色、测试要用）。
+
+    chrome 摆进**根布局的第一格**：根布局原有的留白（卡片边距）整块搬进一个内容容器，
+    所以标题条能铺满窗口整宽、内容该留多少白还是多少白。
+
+    为什么不是"chrome 浮在窗口顶上 + 事件过滤器跟着改大小"（那是第一版写法，能跑）：
+    过滤器在窗口的 ``Resize``/``Show`` 事件**投递过程中**调 ``setGeometry()`` 会炸 ——
+    连跑 20 轮"建一个图片查看器再销毁"，第 2 轮**硬崩**（没有 Python 栈、退出码还是
+    莫名其妙的 127）。改成布局之后 20/20 轮干净通过。**别再改回过滤器那套。**
+    """
+    window.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+    chrome = WindowChrome(window, title=title, controls=controls)
+    old = window.layout()
+    if old is None:                        # 还没建根布局：先只把标题条摆上
+        outer = QVBoxLayout(window)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(chrome)
+        return chrome
+    content = QWidget(window)              # 老布局整块搬进内容容器（Qt 允许这么搬家）
+    content.setLayout(old)
+    outer = QVBoxLayout(window)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
+    outer.addWidget(chrome)
+    outer.addWidget(content, 1)
+    return chrome
+
+
+#: 哪几条边（纯 int 位标记）。**别拿 Qt.Edge 做算术**：PyQt6 的 Qt.Edge 成员不吃
+#: ``int()``（``int(Qt.Edge.LeftEdge)`` 直接 TypeError），混着用必踩坑。
+EDGE_LEFT, EDGE_RIGHT, EDGE_TOP, EDGE_BOTTOM = 1, 2, 4, 8
+
+_EDGE_FLAGS = ((EDGE_LEFT, Qt.Edge.LeftEdge), (EDGE_RIGHT, Qt.Edge.RightEdge),
+               (EDGE_TOP, Qt.Edge.TopEdge), (EDGE_BOTTOM, Qt.Edge.BottomEdge))
+
+
+def _edge_flags(bits: int):
+    """位标记 → ``Qt.Edge``（只有交给 ``startSystemResize()`` 时才需要转回去）。"""
+    flags = Qt.Edge(0)
+    for bit, flag in _EDGE_FLAGS:
+        if bits & bit:
+            flags |= flag
+    return flags
+
+
+class FramelessResizer(QObject):
+    """无边框窗口的八边缩放（主窗口用）。
+
+    无边框之后系统不再给缩放边框，所以：鼠标靠近窗口边缘 → 换成对应的缩放光标，
+    按下 → ``startSystemResize(edges)`` 把缩放交回系统（原生、跟手）。
+    对话框不需要它（固定尺寸），主窗口没有它就没法拉大小。
+
+    为什么挂在 ``QApplication`` 上：鼠标压在子控件（侧栏、消息区）上时事件是发给那些
+    子控件的，窗口自己收不到 MouseMove —— 想知道"光标离边缘多近"只能监听全应用的
+    鼠标事件再换算（本仓库的批量扫选用的也是这一招）。
+    """
+
+    MARGIN = 6
+
+    def __init__(self, window, *, margin: int = MARGIN):
+        super().__init__(window)
+        self.window = window
+        self.margin = int(margin)
+        self._app = None
+        self._active = False
+
+    # ------------------------------------------------------------------ 生命周期
+    def attach(self) -> None:
+        from PyQt6.QtWidgets import QApplication
+        if self._app is None:
+            self._app = QApplication.instance()
+        if self._app is not None and not self._active:
+            self._app.installEventFilter(self)
+            self._active = True
+            # 窗口销毁时**必须**摘掉这个全应用过滤器：留着就是个悬空指针，
+            # 下一次有人给应用送鼠标/键盘事件时就崩（现场：随机崩在某个用例里，
+            # 没有 Python 栈、退出码还莫名其妙）。
+            try:
+                self.window.destroyed.connect(self._on_window_destroyed)
+            except (AttributeError, TypeError):
+                pass
+
+    def _on_window_destroyed(self, *_args) -> None:
+        self.detach()
+
+    def detach(self) -> None:
+        if self._app is not None and self._active:
+            try:
+                self._app.removeEventFilter(self)
+            except (RuntimeError, TypeError, AttributeError):
+                pass                        # 窗口/应用已销毁：Qt 拒绝把死对象转成 C++ 指针
+            self._active = False
+
+    def is_attached(self) -> bool:
+        return self._active
+
+    # ------------------------------------------------------------------ 判定
+    def edges_at(self, local: QPoint) -> int:
+        """窗口内坐标 ``local`` 压在哪几条边上（位标记，0 = 不在边缘，不该改光标）。"""
+        bits = 0
+        rect = self.window.rect()
+        if not rect.contains(local):
+            return 0
+        if local.x() <= self.margin:
+            bits |= EDGE_LEFT
+        if local.x() >= rect.width() - self.margin:
+            bits |= EDGE_RIGHT
+        if local.y() <= self.margin:
+            bits |= EDGE_TOP
+        if local.y() >= rect.height() - self.margin:
+            bits |= EDGE_BOTTOM
+        return bits
+
+    def cursor_for(self, bits: int):
+        """边角 ↔ 缩放光标（对角线用斜向的，四条边用横竖的）；不在边缘给 None。"""
+        if not bits:
+            return None
+        if bits in (EDGE_LEFT | EDGE_TOP, EDGE_RIGHT | EDGE_BOTTOM):
+            return Qt.CursorShape.SizeFDiagCursor            # ↖↘ 那条斜线
+        if bits in (EDGE_RIGHT | EDGE_TOP, EDGE_LEFT | EDGE_BOTTOM):
+            return Qt.CursorShape.SizeBDiagCursor            # ↗↙
+        if bits & (EDGE_LEFT | EDGE_RIGHT):
+            return Qt.CursorShape.SizeHorCursor
+        return Qt.CursorShape.SizeVerCursor
+
+    # ------------------------------------------------------------------ 事件
+    def _widget_under(self, global_point):
+        from PyQt6.QtWidgets import QApplication
+        target = QApplication.widgetAt(global_point)
+        return None if target is None else target.window()
+
+    def eventFilter(self, obj, event) -> bool:           # noqa: N802
+        """**只看不吞**（除边缘按下那一下，一律返回 False）：不影响点击、拖动、选文字。
+
+        这个过滤器跑在**全应用的每一次鼠标移动**上，一旦抛异常就是刷屏 + 交互变卡，
+        所以宁可吞掉（真出错由 tests/test_window_chrome.py 那组用例兜住）。
+        """
+        if not self._active:
+            return False
+        window = self.window
+        try:
+            if window is None or not window.isVisible():
+                return False
+            if self._widget_under(event.globalPosition().toPoint()) is not window:
+                return False                    # 鼠标其实压在别的窗口（对话框）上
+            kind = event.type()
+            if kind == QEvent.Type.MouseMove:
+                bits = self.edges_at(window.mapFromGlobal(
+                    event.globalPosition().toPoint()))
+                want = self.cursor_for(bits)
+                current = window.cursor().shape()
+                if want is None:
+                    if current != Qt.CursorShape.ArrowCursor:
+                        window.unsetCursor()
+                elif current != want:
+                    # **只在真的变了才设**：这个过滤器跑在每一次鼠标移动上，
+                    # 每次都去改窗口状态是给自己找麻烦（Qt 的事件投递里改状态，
+                    # 改重了就是硬崩 —— 同页 _follow_window 那个坑的教训）。
+                    window.setCursor(want)
+            elif (kind == QEvent.Type.MouseButtonPress
+                  and event.button() == Qt.MouseButton.LeftButton):
+                bits = self.edges_at(window.mapFromGlobal(
+                    event.globalPosition().toPoint()))
+                if bits:
+                    handle = window.windowHandle()
+                    if handle is not None:
+                        handle.startSystemResize(_edge_flags(bits))
+                        return True      # 这一下必须吞掉：不然标题条会同时开始拖动
+        except Exception:                        # noqa: BLE001 —— 见 docstring
+            return False
+
+        return False
 
 
 # ---------------------------------------------------------------------------

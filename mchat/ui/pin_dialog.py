@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
                              QVBoxLayout)
 
 from . import theme
-from .widgets import ToggleSwitch
+from .widgets import ToggleSwitch, install_app_chrome
 
 __all__ = ["PinDialog", "ask_pin"]
 
@@ -67,6 +67,9 @@ class PinDialog(QDialog):
         root.addLayout(buttons)
 
         self.checkbox.toggled.connect(self._on_checkbox_changed)
+
+        # 无边框 + 自绘 ✕。标题留空：这个窗口自己就写着「置顶这条消息」，别重复
+        self.chrome = install_app_chrome(self, title="")
         self._sync_scope_hint()
 
     # ------------------------------------------------------------------ 状态
@@ -104,6 +107,7 @@ class PinDialog(QDialog):
             f"QLabel#pinOptionText {{ font-size: 13.5px; color: {palette.text}; }}")
         self.setStyleSheet(theme.build_qss(palette) + extra)
         self.checkbox.apply_palette(palette)
+        self.chrome.apply_palette(palette)
 
 
 def ask_pin(parent, palette, *, peer_label: str = "", for_both: bool = False):

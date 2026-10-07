@@ -42,7 +42,8 @@ from .transport import (EVENT_ATTACHMENT_SENT, EVENT_CONVERSATION, EVENT_FRIEND_
                         EVENT_FRIEND_REJECT, EVENT_FRIEND_REMOVE,
                         EVENT_FRIEND_REQUEST, EVENT_MESSAGE, EVENT_PIN,
                         EVENT_PRESENCE, EVENT_REACTION, EVENT_READ, EVENT_RESYNC,
-                        EVENT_SEND_BLOCKED, EVENT_TYPING, ChatTransport, Outgoing,
+                        EVENT_SEND_BLOCKED, EVENT_TYPING, EVENT_UPLOAD_PROGRESS,
+                        ChatTransport, Outgoing,
                         TransportEvent)
 
 __all__ = ["NetworkTransport"]
@@ -81,6 +82,7 @@ class NetworkTransport(ChatTransport):
         self._tasks: list[tuple] = []            # 已读回执 / 正在输入这类"顺路做一下"的小活
         self._events: list[TransportEvent] = []  # 待界面取走的事件
         self._uploaded: dict[tuple, str] = {}    # (路径, 大小) -> 服务器附件 id（同一张图别重复上传）
+        self._progress: dict[str, int] = {}      # message_id -> 已经报过的百分比（节流用）
         self._cursor = 0
         self._primed = False                     # 第一次同步（游标从"现在"起）做过没有
         self._error = ""                         # 最近一次网络错误（界面上显示"离线 · 原因"）
@@ -336,13 +338,20 @@ class NetworkTransport(ChatTransport):
             with self._lock:
                 if self._outbox and self._outbox[0] is item:
                     self._outbox.pop(0)
+                self._progress.pop(item.message_id, None)   # 发出去了，进度记录清掉
                 self._sent += 1
 
     def _send_one(self, outgoing: Outgoing) -> None:
         attachment_id = ""
         attachment = outgoing.attachment
         if attachment is not None and not attachment.is_remote:
-            attachment_id = self._upload(attachment)
+            try:
+                attachment_id = self._upload(
+                    attachment, on_progress=lambda done, total:
+                    self._note_upload_progress(outgoing, done, total))
+            except Exception as error:                # 上传没成：界面上要说清"正在重试"
+                self._note_upload_failed(outgoing, error)
+                raise
         if attachment_id:
             # 把"服务端那份附件叫什么 id"交给界面记下来（并落库）：用户事后删掉本地文件时，
             # 消息才不至于只会说"不在本地了"—— 服务器上还有那份，能按这个 id 取回来。
@@ -377,19 +386,59 @@ class NetworkTransport(ChatTransport):
         with self._lock:
             self._events.append(event)
 
-    def _upload(self, attachment: Attachment) -> str:
-        """上传一次就记住（同一个文件改个名再发不算——按路径+大小认）。"""
+    def _upload(self, attachment: Attachment, *, on_progress=None) -> str:
+        """上传一次就记住（同一个文件改个名再发不算——按路径+大小认）。
+
+        已经传过的直接命中缓存 —— 这时也要**补报一次 100%**，否则界面那条进度条会
+        停在 0 上（用户看到的是"发出去了但进度条没动"）。
+        """
         key = (attachment.path, attachment.size)
         with self._lock:
             cached = self._uploaded.get(key)
         if cached:
+            if on_progress is not None:
+                try:
+                    on_progress(1, 1)
+                except Exception:                    # noqa: BLE001
+                    pass
             return cached
-        info = self.api.upload(attachment.path, name=attachment.name)
+        info = self.api.upload(attachment.path, name=attachment.name,
+                               on_progress=on_progress)
         file_id = str(info.get("id") or "")
         if file_id:
             with self._lock:
                 self._uploaded[key] = file_id
         return file_id
+
+    def _note_upload_progress(self, outgoing: Outgoing, done: int, total: int) -> None:
+        """把上传进度交给界面。**按整数百分比节流**：64KB 一块、每块都入队会把队列刷爆。
+
+        100% 是例外（永远放行）：同一个文件再发一次会直接命中上传缓存，那时只会
+        报这一档 —— 挡住的话界面那条进度条就永远停在 0 上了。
+        """
+        if not total:
+            return
+        percent = int(done * 100 / total)
+        with self._lock:
+            if percent < 100 and self._progress.get(outgoing.message_id) == percent:
+                return
+            self._progress[outgoing.message_id] = percent
+            self._events.append(TransportEvent(
+                kind=EVENT_UPLOAD_PROGRESS, conversation_id=outgoing.conversation_id,
+                message_id=outgoing.message_id, progress=min(1.0, done / total)))
+
+    def _note_upload_failed(self, outgoing: Outgoing, error: BaseException) -> None:
+        """这一轮上传失败了：让界面显示"上传失败，正在重试"。
+
+        事件只是**通知**，不改变控制流 —— 异常照原样抛出去，发件箱还是把这条留在队首，
+        退避之后自动重发（服务端幂等，重传不会变成两条）。
+        """
+        text = str(getattr(error, "friendly", "") or "") or f"{type(error).__name__}: {error}"
+        with self._lock:
+            self._progress.pop(outgoing.message_id, None)
+            self._events.append(TransportEvent(
+                kind=EVENT_UPLOAD_PROGRESS, conversation_id=outgoing.conversation_id,
+                message_id=outgoing.message_id, failed=True, error=text))
 
     def _long_poll(self) -> None:
         first = not self._primed

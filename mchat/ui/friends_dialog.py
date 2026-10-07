@@ -24,7 +24,8 @@ from PyQt6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
 from .async_call import AsyncCall
 from .avatar import Avatar
 from .theme import Palette, build_qss, resolve_palette
-from .widgets import FloatingLabelInput, SegmentedControl, confirm_destructive
+from .widgets import (CHROME_H, FloatingLabelInput, SegmentedControl,
+                      confirm_destructive, install_app_chrome)
 
 __all__ = ["FriendsDialog", "PersonRow", "MODE_FRIENDS", "MODE_REQUESTS",
            "REMOVE_WARNING", "BLOCKED_NOTICE"]
@@ -196,6 +197,10 @@ class FriendsDialog(QDialog):
         box.addWidget(self.requests_page, 1)
         box.addWidget(self.status_label)
         self._on_mode_changed(MODE_FRIENDS)
+
+        # 无边框 + 自绘 ✕；窗口是固定尺寸的，高度要把标题条那一条算进去
+        self.chrome = install_app_chrome(self, title=self.windowTitle())
+        self.setFixedSize(DIALOG_W, DIALOG_H + CHROME_H)
 
     def _make_scroll(self, host: QWidget) -> QScrollArea:
         area = QScrollArea(self)
@@ -414,6 +419,7 @@ class FriendsDialog(QDialog):
     def apply_palette(self, palette: Palette) -> None:
         self._palette = palette
         self.setStyleSheet(build_qss(palette))
+        self.chrome.apply_palette(palette)
         self.mode_seg.apply_palette(palette)
         self.search_field.apply_palette(palette)
         self.note_field.apply_palette(palette)

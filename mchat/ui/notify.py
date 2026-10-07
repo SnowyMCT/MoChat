@@ -175,6 +175,13 @@ class Notifier(_NotifierBase):
         self._sound_enabled = True
         self._icon = icon
         self._tray = None          # QSystemTrayIcon | None
+        self._menu = None          # 托盘右键菜单（必须留引用，否则被回收）
+        self._on_show = None       # 点托盘 → 把主窗口叫回来
+        self._on_quit = None       # 托盘菜单 → 退出程序
+        self._on_message_click = None   # 点通知气泡 → 打开那条消息的会话
+        self._last_notification = ""    # 最近一条通知属于哪个会话（点它才知道跳去哪）
+        self._notification_pending = False   # 有没有"还能点"的通知
+        self._unread = 0
         self._effect = None        # QSoundEffect | None（延迟创建）
         self._sound_broken = False # 试过一次就不反复重试 import，免得每条消息都卡
         self._build_tray()
@@ -213,9 +220,122 @@ class Notifier(_NotifierBase):
     def sound_enabled(self) -> bool:
         return self._sound_enabled
 
+    # ---- 托盘常驻 / 未读提示 -------------------------------------------
+    def show_icon(self) -> None:
+        """让托盘图标常驻（登录进主界面时调一次）。没托盘时静默跳过。"""
+        tray = self._tray
+        if tray is None or not self.available():
+            return
+        try:
+            if not tray.isVisible():
+                tray.show()
+        except Exception:                              # noqa: BLE001 —— 托盘坏了不该影响启动
+            pass
+
+    def set_actions(self, on_show=None, on_quit=None) -> None:
+        """给托盘挂上右键菜单（显示主窗口 / 退出）和点击行为。
+
+        用**普通回调**而不是 pyqtSignal：这个模块在缺 Qt 的环境里也要能导入
+        （``_NotifierBase`` 会退化成 ``object``，类体里就没法声明信号）。
+        """
+        self._on_show = on_show
+        self._on_quit = on_quit
+        tray = self._tray
+        if tray is None:
+            return
+        try:
+            from PyQt6.QtWidgets import QMenu, QSystemTrayIcon
+            menu = QMenu()
+            menu.addAction("显示主窗口").triggered.connect(
+                lambda *_: self._call(self._on_show))
+            menu.addAction("退出 MChat").triggered.connect(
+                lambda *_: self._call(self._on_quit))
+            tray.setContextMenu(menu)
+            self._menu = menu          # 不留引用的话菜单当场被 GC，托盘右键就没反应了
+            tray.activated.connect(self._on_activated)
+        except Exception:                              # noqa: BLE001
+            self._menu = None
+
+    def set_message_click_handler(self, handler) -> None:
+        """点系统通知气泡 = 打开那条消息所属的会话（Windows 点通知的行为）。
+
+        回调是**普通函数**（不是信号）：没 Qt 的环境里这个模块也要能导入。
+        通知里带的会话 id 是发通知那一刻记下的（见 :meth:`message`）。
+        """
+        self._on_message_click = handler
+        tray = self._tray
+        if tray is None:
+            return
+        try:
+            tray.messageClicked.connect(self._on_message_clicked)
+        except Exception:                              # noqa: BLE001
+            self._on_message_click = None
+
+    def _on_message_clicked(self) -> None:
+        """托盘通知被点了：把"那是哪个会话"交给上层，然后清掉（同一条只跳一次）。
+
+        没有待处理的通知时**不回调** —— 否则"点了一下已经消失的通知"会拿着空 id
+        去骚扰上层（实测：第二次点击会把 handler 叫起来一次）。
+        """
+        handler = self._on_message_click
+        if not self._notification_pending:
+            return
+        self._notification_pending = False
+        conversation_id, self._last_notification = self._last_notification, ""
+        if not callable(handler):
+            return
+        self._call(lambda: handler(conversation_id))
+
+    def set_unread(self, count: int, *, label: str = "MChat") -> None:
+        """把未读数写到托盘提示上（Windows 托盘没有数字角标，工具提示是最像样的那档）。"""
+        try:
+            self._unread = max(0, int(count))
+        except (TypeError, ValueError):
+            self._unread = 0
+        tray = self._tray
+        if tray is None:
+            return
+        text = f"{label} — {self._unread} 条未读" if self._unread else label
+        try:
+            if tray.toolTip() != text:
+                tray.setToolTip(text)
+        except Exception:                              # noqa: BLE001
+            pass
+
+    def unread(self) -> int:
+        return self._unread
+
+    def _on_activated(self, reason) -> None:
+        """左键单击 / 双击托盘 = 把主窗口叫回来（Windows 习惯是双击，两个都接）。"""
+        try:
+            from PyQt6.QtWidgets import QSystemTrayIcon
+            wanted = (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick)
+            if reason in wanted:
+                self._call(self._on_show)
+        except Exception:                              # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _call(func) -> None:
+        try:
+            if callable(func):
+                func()
+        except Exception:                              # noqa: BLE001 —— 回调是别人的代码
+            pass
+
     # ---- 对外入口 --------------------------------------------------------
-    def message(self, title: str, body: str) -> None:
-        """弹一条系统通知（+ 可选提示音）。**任何失败都吞掉，绝不抛给调用方。**"""
+    def message(self, title: str, body: str, *, conversation_id: str = "") -> None:
+        """弹一条系统通知（+ 可选提示音）。**任何失败都吞掉，绝不抛给调用方。**
+
+        ``conversation_id`` 是"这条通知从哪来"：用户点通知时回到那条会话去
+        （``set_message_click_handler`` 收的回调会拿到它）。
+        """
+        # 先记下来源（纯字符串赋值，跨线程安全）：点通知的时机可能远晚于这里
+        try:
+            self._last_notification = str(conversation_id or "")
+        except Exception:                              # noqa: BLE001
+            self._last_notification = ""
         try:
             if not self._enabled:
                 return
@@ -274,6 +394,8 @@ class Notifier(_NotifierBase):
                 return
         except Exception:
             return
+        # 真的弹出去了：这条通知之后可以被点（点了回到它的会话）
+        self._notification_pending = True
         try:
             self._send_to_tray(title, body)
         except Exception:

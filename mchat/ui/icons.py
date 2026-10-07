@@ -198,6 +198,36 @@ def _people(painter: QPainter, color: QColor) -> None:
     painter.drawPath(front)
 
 
+def _win_close(painter: QPainter, color: QColor) -> None:
+    """关闭：一个 ✕。"""
+    _pen(painter, color, 0.10)
+    painter.drawLine(QPointF(0.30, 0.30), QPointF(0.70, 0.70))
+    painter.drawLine(QPointF(0.70, 0.30), QPointF(0.30, 0.70))
+
+
+def _win_minimize(painter: QPainter, color: QColor) -> None:
+    """最小化：一条横线。"""
+    _pen(painter, color, 0.10)
+    painter.drawLine(QPointF(0.28, 0.50), QPointF(0.72, 0.50))
+
+
+def _win_maximize(painter: QPainter, color: QColor) -> None:
+    """最大化：一个空心方框。"""
+    _pen(painter, color, 0.09)
+    painter.drawRect(QRectF(0.30, 0.30, 0.40, 0.40))
+
+
+def _win_restore(painter: QPainter, color: QColor) -> None:
+    """还原（已经最大化时）：两个错位的小方框。"""
+    _pen(painter, color, 0.09)
+    painter.drawRect(QRectF(0.26, 0.36, 0.36, 0.36))
+    path = QPainterPath()
+    path.moveTo(0.38, 0.28)                # 后面那个框只画露出来的两条边
+    path.lineTo(0.74, 0.28)
+    path.lineTo(0.74, 0.64)
+    painter.drawPath(path)
+
+
 _PAINTERS = {
     "search": _search,
     "send": _send,
@@ -212,6 +242,10 @@ _PAINTERS = {
     "image": _image,
     "gear": _gear,
     "people": _people,
+    "win_close": _win_close,
+    "win_minimize": _win_minimize,
+    "win_maximize": _win_maximize,
+    "win_restore": _win_restore,
 }
 
 
@@ -257,6 +291,11 @@ class IconButton(QToolButton):
     def set_icon_color(self, color: str) -> None:
         self._color = color
         self.setIcon(make_icon(self._kind, color, self._size))
+
+    def set_icon_kind(self, kind: str) -> None:
+        """换一个图标（同一个按钮在不同状态下画不同的东西：最大化 ↔ 还原）。"""
+        self._kind = kind
+        self.setIcon(make_icon(kind, self._color, self._size))
 
     def icon_kind(self) -> str:
         return self._kind

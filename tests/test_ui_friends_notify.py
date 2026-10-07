@@ -74,9 +74,14 @@ class Recorder:
 
     def __init__(self):
         self.calls = []
+        self.conversation_ids = []      # 每条通知带的"从哪个会话来"（点它要跳回去）
 
-    def message(self, title, body):
+    def message(self, title, body, *, conversation_id=""):
+        # 真 Notifier 会多带一个"这条通知来自哪个会话"，假实现收下存着 ——
+        # **签名必须对得上**：对不上时主窗口那次调用会被它自己的 try/except 吞掉，
+        # 症状是"该弹的通知一条都没弹"（看着像 flake，其实每次都会挂）。
         self.calls.append((title, body))
+        self.conversation_ids.append(str(conversation_id or ""))
 
     def set_enabled(self, value):
         pass
@@ -161,6 +166,12 @@ def test_incoming_message_notifies_but_own_message_does_not(server):
                         and bool(bob.store.get(cid)), timeout=20)
 
         alice.select_conversation(cid)
+        # "bob 没在看窗口"是这条测试的**前提**，必须显式立住：整仓跑的时候，前面的用例
+        # 可能给别的窗口留了 active 状态，于是通知被"你就在看"那条规则合理挡掉
+        # （表现成"满负载必挂、单独跑必过"的假 flake）。
+        QApplication.setActiveWindow(alice)
+        pump(case.app, 80)
+        assert not bob.isActiveWindow(), "前提没立住：bob 的窗口当前是 active 的"
         alice._notifier.calls.clear()
         bob._notifier.calls.clear()
         assert alice.send_message("通知测试") is True
@@ -173,6 +184,7 @@ def test_incoming_message_notifies_but_own_message_does_not(server):
         assert bob._notifier.calls, "别人发来的消息应该弹桌面通知"
         title, body = bob._notifier.calls[-1]
         assert "通知测试" in body, bob._notifier.calls
+        assert bob._notifier.conversation_ids[-1] == cid, "通知要带上会话 id，点了才能跳回去"
         assert title in ("爱丽丝", "鲍勃"), title     # 单聊用对方显示名当标题
     finally:
         case.close()
@@ -295,7 +307,7 @@ def test_settings_has_notification_toggles(server):
         assert alice.notifications_enabled() is True
         assert alice.sound_enabled() is True
         dialog = alice.open_settings()
-        assert dialog.card_count() == 5, dialog.card_count()
+        assert dialog.card_count() == 6, dialog.card_count()
         assert dialog.notifications_enabled() is True
         assert dialog.sound_enabled() is True
 

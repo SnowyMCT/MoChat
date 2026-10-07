@@ -28,6 +28,7 @@ from mchat.ui.security_tool import (ALGORITHM_AES, ALGORITHM_BASE64,       # noq
                                     SecurityToolDialog,
                                     SecurityToolWidget)
 from mchat.ui.theme import DARK, LIGHT                                    # noqa: E402
+from mchat.ui.widgets import CHROME_H                                      # noqa: E402
 from ui_probe import glyph_pixels, pump, wait_for                           # noqa: E402
 
 ARTIFACTS = os.path.join(ROOT, "artifacts")
@@ -68,8 +69,9 @@ def main() -> int:
 
     # --- 窗口包装 ---------------------------------------------------------
     check("对话框标题正确", dialog.windowTitle() == "安全工具箱 · MChat", dialog.windowTitle())
-    check("对话框尺寸贴合面板",
-          dialog.size().width() == win.width() and dialog.size().height() == win.height(),
+    check("对话框尺寸贴合面板（外加顶上自绘标题条那一条）",
+          dialog.size().width() == win.width()
+          and dialog.size().height() == win.height() + CHROME_H,
           f"{dialog.size()} vs {win.size()}")
     check("对话框属性转发可用", dialog.output_text() == "" and dialog.tool is win)
     check("工具箱是独立顶层窗口（非模态）", dialog.isModal() is False)

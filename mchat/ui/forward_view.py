@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
 from .avatar import Avatar
 from . import flag_text
 from .theme import build_qss
+from .widgets import install_app_chrome
 
 __all__ = ["MergedViewerDialog"]
 
@@ -146,6 +147,9 @@ class MergedViewerDialog(QDialog):
         foot.addWidget(self.close_btn)
         root.addLayout(foot)
 
+        # 无边框 + 自绘 ✕（系统标题栏那套不再出现）
+        self.chrome = install_app_chrome(self, title=self.windowTitle())
+
     # ------------------------------------------------------------------ 接口
     def set_message(self, message) -> None:
         """按一条"合并转发"消息重建列表。"""
@@ -180,5 +184,6 @@ class MergedViewerDialog(QDialog):
     def apply_palette(self, palette) -> None:
         self._palette = palette
         self.setStyleSheet(build_qss(palette))
+        self.chrome.apply_palette(palette)
         for row in self._rows:
             row.apply_palette(palette)

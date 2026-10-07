@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (QDialog, QFrame, QLabel, QPushButton, QScrollArea,
                              QSizePolicy, QVBoxLayout, QWidget)
 
 from .theme import build_qss
-from .widgets import SegmentedControl
+from .widgets import SegmentedControl, install_app_chrome, CHROME_H
 
 __all__ = ["ForwardDialog", "MODE_SINGLE", "MODE_MERGE",
            "FORWARD_WIDTH", "FORWARD_HEIGHT", "ROW_HEIGHT"]
@@ -72,6 +72,10 @@ class ForwardDialog(QDialog):
         root.addWidget(self.scope_control)
         root.addWidget(self._build_list(), 1)
         self.sync_header()
+
+        # 无边框 + 自绘 ✕；固定尺寸的窗口，高度要把标题条那一条算进去
+        self.chrome = install_app_chrome(self, title=self.windowTitle())
+        self.setFixedSize(FORWARD_WIDTH, FORWARD_HEIGHT + CHROME_H)
 
     # ================================================================== 搭建
     def _build_header(self) -> QWidget:
@@ -220,4 +224,5 @@ class ForwardDialog(QDialog):
         self._palette = palette
         self.setStyleSheet(build_qss(palette))
         self.scope_control.apply_palette(palette)
+        self.chrome.apply_palette(palette)
         self._sync_row_texts()               # QSS 里的字号换了，截断宽度跟着重算

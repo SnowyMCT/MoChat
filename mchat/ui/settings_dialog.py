@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
 
 from . import anim
 from . import theme
-from .widgets import SegmentedControl, ToggleSwitch, mix_color
+from .widgets import SegmentedControl, ToggleSwitch, mix_color, install_app_chrome
 
 __all__ = ["SettingsDialog", "SettingsCard"]
 
@@ -168,6 +168,7 @@ class SettingsDialog(QDialog):
     fontScaleChanged = pyqtSignal(float)
     animationsToggled = pyqtSignal(bool)
     notifyToggled = pyqtSignal(bool)
+    closeToTrayToggled = pyqtSignal(bool)    # 「关闭窗口时最小化到托盘」
     soundToggled = pyqtSignal(bool)
     openDataDirRequested = pyqtSignal()
 
@@ -198,6 +199,9 @@ class SettingsDialog(QDialog):
         self.foot = QLabel("所有设置即时生效", self)
         self.foot.setObjectName("settingsFoot")
         root.addWidget(self.foot)
+
+        # 无边框 + 自绘 ✕（系统标题栏那套不再出现）
+        self.chrome = install_app_chrome(self, title=self.windowTitle())
 
     # ================================================================== 搭建
     def _build_header(self) -> QVBoxLayout:
@@ -291,12 +295,26 @@ class SettingsDialog(QDialog):
         self.sound_hint.setObjectName("settingHint")
         self.sound_hint.setWordWrap(True)
         notice.add_control_row(self.sound_switch, self.sound_hint)
-        return [look, motion, data, about, notice]
+
+        # ---- 窗口行为：✕ 之后怎么走（同样放在最后，不动既有卡片下标）----
+        # 默认**关**：保持"✕ = 退出程序"这个老行为，用户自己选才收进托盘。
+        window_card = SettingsCard("窗口行为", "点 ✕ 之后程序怎么走")
+        self.tray_switch = ToggleSwitch(False, self)
+        self.tray_switch.toggled.connect(self._on_tray_toggled)
+        self.tray_value = QLabel("", self)
+        self.tray_value.setObjectName("settingValue")
+        window_card.add_trailing(self.tray_value)
+        self.tray_hint = QLabel("", self)
+        self.tray_hint.setObjectName("settingHint")
+        self.tray_hint.setWordWrap(True)
+        window_card.add_control_row(self.tray_switch, self.tray_hint)
+        return [look, motion, data, about, notice, window_card]
 
     # ================================================================== 状态同步
     def sync(self, *, theme_name: str | None = None, font_scale: float | None = None,
              animations: bool | None = None, stats: dict | None = None,
              notifications: bool | None = None, sound: bool | None = None,
+             close_to_tray: bool | None = None,
              data_path: str = "", transport: str = "") -> None:
         """把主窗口的当前状态贴到控件上（都走 ``notify=False``，不回抛信号）。"""
         if theme_name is not None:
@@ -330,6 +348,9 @@ class SettingsDialog(QDialog):
             self.sound_hint.setText("新消息会响一声提示音"
                                     if sound else
                                     "已关闭：收到消息不响提示音")
+        if close_to_tray is not None:
+            self.tray_switch.set_checked(close_to_tray, animate=False, notify=False)
+            self._sync_tray_text(close_to_tray)
         if stats is not None:
             self.stats_label.setText(
                 f"消息 {stats.get('messages', 0)} 条 · 附件 {stats.get('attachments', 0)} 个 · "
@@ -356,6 +377,9 @@ class SettingsDialog(QDialog):
 
     def sound_enabled(self) -> bool:
         return self.sound_switch.is_checked()
+
+    def close_to_tray(self) -> bool:
+        return self.tray_switch.is_checked()
 
     def card_count(self) -> int:
         return len(self.cards)
@@ -446,6 +470,18 @@ class SettingsDialog(QDialog):
                                 "已关闭：收到消息不响提示音")
         self.soundToggled.emit(enabled)
 
+    def _sync_tray_text(self, enabled: bool) -> None:
+        """开关右边那两行字必须和真行为一致：收进托盘 ≠ 退出程序。"""
+        self.tray_value.setText("收进托盘" if enabled else "直接退出")
+        self.tray_hint.setText(
+            "点 ✕ 只把窗口收进托盘：消息照收、通知照弹。要真的退出，点托盘图标 →「退出 MChat」"
+            if enabled else
+            "点 ✕ 直接退出程序（默认）")
+
+    def _on_tray_toggled(self, enabled: bool) -> None:
+        self._sync_tray_text(enabled)
+        self.closeToTrayToggled.emit(bool(enabled))
+
     # ================================================================== 皮肤
     def apply_palette(self, palette) -> None:
         """整套样式表 + 各控件重上色（字号也在这里跟着 theme.font_scale() 走）。"""
@@ -455,7 +491,9 @@ class SettingsDialog(QDialog):
         self.font_control.apply_palette(palette)
         self.motion_switch.apply_palette(palette)
         self.notify_switch.apply_palette(palette)
+        self.tray_switch.apply_palette(palette)
         self.sound_switch.apply_palette(palette)
+        self.chrome.apply_palette(palette)
         for card in self.cards:
             card.apply_palette(palette)
         for label in (self.foot, self.data_path_label):

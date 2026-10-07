@@ -21,7 +21,7 @@ from ..core.models import format_list_time
 from . import anim
 from . import flag_text
 from .theme import build_qss
-from .widgets import FloatingLabelInput, SegmentedControl
+from .widgets import FloatingLabelInput, SegmentedControl, install_app_chrome
 
 __all__ = ["SearchDialog"]
 
@@ -144,6 +144,9 @@ class SearchDialog(QDialog):
         box.addWidget(self.hint)
         box.addWidget(area, 1)
 
+        # 无边框 + 自绘 ✕（系统标题栏那套不再出现）
+        self.chrome = install_app_chrome(self, title=self.windowTitle())
+
         # 防抖：打字时只重置计时器，停手 180ms 才真的查库
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -252,6 +255,7 @@ class SearchDialog(QDialog):
         self.setStyleSheet(build_qss(palette))
         self.search_field.apply_palette(palette)
         self.scope_control.apply_palette(palette)
+        self.chrome.apply_palette(palette)
 
     # ------------------------------------------------------------------ 内部
     def _show_idle_hint(self) -> None:

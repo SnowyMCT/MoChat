@@ -14,8 +14,8 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QFrame,
 
 from ..core import crypto
 from .theme import Palette, build_qss
-from .widgets import (CollapsibleSection, FloatingLabelInput, SegmentedControl,
-                      Toast)
+from .widgets import (CHROME_H, CollapsibleSection, FloatingLabelInput,
+                      SegmentedControl, Toast, install_app_chrome)
 
 __all__ = ["ALGORITHM_BASE64", "ALGORITHM_AES", "SecurityToolWidget",
            "SecurityToolDialog"]
@@ -425,7 +425,10 @@ class SecurityToolDialog(QDialog):
         box = QVBoxLayout(self)
         box.setContentsMargins(0, 0, 0, 0)
         box.addWidget(self.tool)
-        self.setFixedSize(self.tool.width(), self.tool.height())
+
+        # 无边框 + 自绘 ✕；窗口尺寸 = 工具本体 + 顶上那条标题条
+        self.chrome = install_app_chrome(self, title=self.windowTitle())
+        self.setFixedSize(self.tool.width(), self.tool.height() + CHROME_H)
 
     def __getattr__(self, name: str):
         """没定义的属性转发给内部的转换器本体。
@@ -442,6 +445,7 @@ class SecurityToolDialog(QDialog):
         """对话框是顶层窗口，不继承主窗口的样式表，得自己设一份。"""
         self.tool.apply_palette(p)
         self.setStyleSheet(build_qss(p))
+        self.chrome.apply_palette(p)
         pal = self.palette()
         pal.setColor(QPalette.ColorRole.Window, QColor(p.surface))
         pal.setColor(QPalette.ColorRole.WindowText, QColor(p.text))

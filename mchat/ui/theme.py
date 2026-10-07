@@ -516,6 +516,66 @@ def build_qss(p: Palette, *, scale: float | None = None) -> str:
     QCheckBox::indicator:hover {{ border-color: {p.accent}; }}
     QCheckBox::indicator:checked {{ background-color: {p.accent}; border-color: {p.accent}; }}
 
+    /* ------------------------- 拖文件进来的落点提示（浮层，不进布局）-- */
+    QLabel#dropHint {{
+        background-color: {p.toast_bg};
+        color: {p.toast_text};
+        border: 2px dashed {p.accent};
+        border-radius: 14px;
+        font-family: {FONT_STACK};
+        font-size: 14px;
+        font-weight: 600;
+        padding: 8px;
+    }}
+
+    /* ------------------------- 附件上传进度（气泡里那条细线）-- */
+    QFrame#uploadTrack {{ background-color: {p.track}; border: none; border-radius: 2px; }}
+    QFrame#uploadFill {{ background-color: {p.accent}; border: none; border-radius: 2px; }}
+    QLabel#uploadText {{ font-family: {FONT_STACK}; font-size: 11px; color: {p.muted}; }}
+    QWidget#uploadBar[state="failed"] QFrame#uploadFill {{ background-color: {p.danger}; }}
+    QWidget#uploadBar[state="failed"] QLabel#uploadText {{ color: {p.danger}; }}
+    /* 自己发出去的气泡是深色底：轨道/填充/文字都得提亮才看得见 */
+    QFrame#bubbleOut QFrame#uploadTrack {{ background-color: rgba(255, 255, 255, 0.38); }}
+    QFrame#bubbleOut QFrame#uploadFill {{ background-color: #FFFFFF; }}
+    QFrame#bubbleOut QLabel#uploadText {{ color: rgba(255, 255, 255, 0.88); }}
+    QFrame#bubbleOut QWidget#uploadBar[state="failed"] QLabel#uploadText {{ color: #FFE3E3; }}
+
+    /* ------------------------- 未读分隔线「以下为 N 条新消息」-- */
+    QFrame#unreadDivider {{
+        background: transparent;
+        border: none;
+        border-top: 1px solid {p.accent_soft};
+    }}
+    QLabel#unreadText {{
+        font-family: {FONT_STACK};
+        font-size: 11.5px;
+        font-weight: 600;
+        color: {p.accent};
+        background-color: transparent;
+    }}
+
+    /* ------------------- 自绘标题条（无边框窗口的"标题栏"）-- */
+    QFrame#chrome {{
+        background-color: {p.window};
+        border: none;
+        border-bottom: 1px solid {p.border};
+    }}
+    QLabel#chromeTitle {{
+        font-family: {FONT_STACK};
+        font-size: 12px;
+        font-weight: 600;
+        color: {p.muted};
+        background: transparent;
+    }}
+    QToolButton#chromeBtn, QToolButton#chromeCloseBtn {{
+        background: transparent;
+        border: none;
+        border-radius: 7px;
+    }}
+    QToolButton#chromeBtn:hover, QToolButton#chromeCloseBtn:hover {{
+        background-color: {p.track};
+    }}
+
     /* ---------------------------------------------------- 滚动条等 -- */
     QScrollBar:vertical {{
         background: transparent; width: 10px; margin: 6px 3px 6px 0;

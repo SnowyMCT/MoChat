@@ -22,7 +22,7 @@ from ..core.api import ApiError, NetworkError
 from .async_call import AsyncCall
 from .avatar import Avatar
 from .theme import Palette, build_qss
-from .widgets import FloatingLabelInput
+from .widgets import FloatingLabelInput, install_app_chrome, CHROME_H
 
 __all__ = ["NewChatDialog", "UserRow"]
 
@@ -196,6 +196,10 @@ class NewChatDialog(QDialog):
         box.addWidget(self.create_btn)
         box.addWidget(self.status_label)
 
+        # 无边框 + 自绘 ✕；固定尺寸的窗口，高度要把标题条那一条算进去
+        self.chrome = install_app_chrome(self, title=self.windowTitle())
+        self.setFixedSize(DIALOG_W, DIALOG_H + CHROME_H)
+
     # ================================================================== 状态
     def status_text(self) -> str:
         return self.status_label.text()
@@ -348,6 +352,7 @@ class NewChatDialog(QDialog):
         self.setStyleSheet(build_qss(palette))
         self.search_field.apply_palette(palette)
         self.title_field.apply_palette(palette)
+        self.chrome.apply_palette(palette)
         self.subtitle.setStyleSheet(f"color: {palette.muted};")
         for row in self._rows.values():
             row.apply_palette(palette)

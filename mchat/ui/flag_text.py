@@ -19,16 +19,23 @@
 from __future__ import annotations
 
 import html
+import re
 from html import escape
 
 from ..core.models import ellipsize
 from . import flags as flag_data
 
 __all__ = ["TEXT_IMAGE_SIZE", "PREVIEW_IMAGE_SIZE", "contains_flag", "split_flags",
-           "to_html", "to_display", "truncate", "assets_available"]
+           "to_html", "to_display", "truncate", "assets_available",
+           "URL_PATTERN", "contains_link", "split_rich"]
 
 TEXT_IMAGE_SIZE = 18            # 气泡/输入框里旗帜的显示边长（正文 13.5px）
 PREVIEW_IMAGE_SIZE = 14         # 会话摘要那行矮，图也小一点
+
+#: 消息里认成链接的形状：只认 ``http(s)://`` 和 ``www.`` 开头。
+#: **不去猜裸域名** —— 中文里"见 a.com"这种误判比漏判更烦人（Telegram 也只做这两类）。
+URL_PATTERN = re.compile(r"(?:https?://|www\.)[^\s\u3000<>\"'（）()【】\[\]，。；]+",
+                         re.IGNORECASE)
 
 _ASSETS_OK: bool | None = None
 
@@ -130,12 +137,73 @@ def truncate(text: str, limit: int, *, ellipsis: str = "…") -> str:
     return ellipsize(text, limit, ellipsis=ellipsis)
 
 
-def to_display(text: str, *, size: int = TEXT_IMAGE_SIZE) -> tuple[str, bool]:
+def to_display(text: str, *, size: int = TEXT_IMAGE_SIZE,
+               links: bool = True) -> tuple[str, bool]:
     """显示用：返回 ``(要显示的字符串, 是不是富文本)``。
 
-    没旗帜、或素材缺失时原样返回纯文本（``rich=False``）—— 调用方据此设
-    ``Qt.TextFormat``，纯文本那条路连转义都不用做。
+    旗帜变图、链接变可点的 ``<a>``，**两种替换在同一趟里做**（``split_rich``），
+    否则"先替换旗帜再找链接"会在已经替换出来的 HTML 上再扫一遍 —— 转义打架，
+    用户输入的标签也有被放出去的风险。
+
+    没有旗帜也没有链接、或者旗帜素材缺失时原样返回纯文本（``rich=False``）——
+    调用方据此设 ``Qt.TextFormat``，纯文本那条路连转义都不用做。
     """
-    if not assets_available() or not contains_flag(text):
+    pieces = split_rich(text)
+    flags_ok = assets_available()
+    out: list[str] = []
+    rich = False
+    for kind, value in pieces:
+        if kind == "flag":
+            tag = _img_tag(value, size) if flags_ok else ""
+            if tag:
+                out.append(tag)
+                rich = True
+            else:
+                out.append(escape(value))        # 素材缺了就退回字符，别丢内容
+        elif kind == "url" and links:
+            href = value if value[:4].lower() == "http" else "http://" + value
+            out.append(f'<a href="{escape(href, quote=True)}">{escape(value)}</a>')
+            rich = True
+        else:
+            out.append(escape(value))
+    if not rich:
         return text, False
-    return to_html(text, size=size), True
+    return "".join(out).replace("\n", "<br>"), True
+
+
+def contains_link(text: str) -> bool:
+    """文本里有没有链接（气泡据此决定要不要连上"点开"那条路）。"""
+    return bool(URL_PATTERN.search(text))
+
+
+def split_rich(text: str) -> list[tuple[str, str]]:
+    """把文本切成 ``[("text" | "flag" | "url", 片段), …]``（一趟扫完，顺序不乱）。
+
+    同一趟里判两种替换，是为了让"旗帜"和"链接"在任何顺序下都互不干扰
+    （链接里不会出现旗帜字符，旗帜也不会是链接的一部分）。
+    """
+    pieces: list[tuple[str, str]] = []
+    plain: list[str] = []
+    index = 0
+    while index < len(text):
+        matched = _match_at(text, index)
+        if matched:
+            if plain:
+                pieces.append(("text", "".join(plain)))
+                plain.clear()
+            pieces.append(("flag", matched))
+            index += len(matched)
+            continue
+        found = URL_PATTERN.match(text, index)
+        if found:
+            if plain:
+                pieces.append(("text", "".join(plain)))
+                plain.clear()
+            pieces.append(("url", found.group(0)))
+            index = found.end()
+            continue
+        plain.append(text[index])
+        index += 1
+    if plain:
+        pieces.append(("text", "".join(plain)))
+    return pieces

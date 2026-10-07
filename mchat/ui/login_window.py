@@ -24,7 +24,8 @@ from ..core.api import ApiClient, ApiError, NetworkError
 from ..core.session import DEFAULT_SERVER, Session, SessionStore, normalize_server
 from .async_call import AsyncCall
 from .theme import Palette, build_qss, resolve_palette
-from .widgets import FloatingLabelInput, SegmentedControl, ToggleSwitch
+from .widgets import (FloatingLabelInput, SegmentedControl, ToggleSwitch,
+                      install_app_chrome)
 
 __all__ = ["LoginWindow", "MODE_LOGIN", "MODE_REGISTER", "plain_http_warning",
            "host_of", "username_problem", "password_problem"]
@@ -238,6 +239,10 @@ class LoginWindow(QWidget):
         outer.addStretch(1)              # 上下也居中：窗口尺寸是定死的（见 _lock_size）
         outer.addLayout(row)
         outer.addStretch(1)
+
+        # 无边框 + 自绘 ✕。必须在 _lock_size() 之前装：它会把根布局的上边距加高一条
+        # 标题条，随后 sizeHint() 量出来的高度才是"含标题条"的那一份
+        self.chrome = install_app_chrome(self, title=self.windowTitle())
 
         self._on_mode_changed(MODE_LOGIN)
 
@@ -518,6 +523,7 @@ class LoginWindow(QWidget):
             field.apply_palette(palette)
         self.mode_seg.apply_palette(palette)
         self.remember_switch.apply_palette(palette)
+        self.chrome.apply_palette(palette)
         self.remember_label.setStyleSheet(f"color: {palette.muted};")
         self.subtitle.setStyleSheet(f"color: {palette.muted};")
         # 状态文字的颜色由 kind 决定：重放一次当前状态，把颜色换到新调色板上

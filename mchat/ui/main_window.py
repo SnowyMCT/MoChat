@@ -26,7 +26,7 @@ from dataclasses import replace
 from PyQt6.QtCore import QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (QColor, QDesktopServices, QGuiApplication, QKeySequence,
                          QPalette, QShortcut)
-from PyQt6.QtWidgets import QHBoxLayout, QMenu, QWidget
+from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMenu, QWidget
 
 from ..core.api import (ApiError, NetworkError, friend_requests_from_json,
                         friends_from_json)
@@ -40,13 +40,13 @@ from ..core.store import FRIENDS, MESSAGE, PIN, RESET, ChatStore, StoreEvent
 from ..core.transport import (EVENT_ATTACHMENT_SENT, EVENT_CONVERSATION, EVENT_FRIEND_REQUEST,
                               EVENT_MESSAGE, EVENT_PIN, EVENT_PRESENCE,
                               EVENT_REACTION, EVENT_READ, EVENT_RESYNC,
-                              EVENT_SEND_BLOCKED, EVENT_TYPING,
+                              EVENT_SEND_BLOCKED, EVENT_TYPING, EVENT_UPLOAD_PROGRESS,
                               FRIEND_EVENT_KINDS, LocalTransport,
                               NullTransport, Outgoing)
 from ..core.net_transport import NetworkTransport
 from ..core.session import Session
 from .attach import pick_file, pick_save_path
-from .chat_view import ATTACH_FILE, ChatView
+from .chat_view import ATTACH_FILE, ChatView, local_file_paths
 from . import anim
 from .async_call import AsyncCall
 from .forward_dialog import ForwardDialog
@@ -65,7 +65,8 @@ from .sidebar import (SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH,
 from .theme import (THEME_OPTIONS, THEME_SYSTEM, Palette, build_qss,
                     clamp_font_scale, font_scale, label_of, menu_qss,
                     resolve_palette, set_font_scale, watch_system_palette)
-from .widgets import SplitHandle, Toast, confirm_destructive
+from .widgets import (CHROME_WINDOW, FramelessResizer, SplitHandle, Toast,
+                      WindowChrome, confirm_destructive, install_app_chrome)
 
 __all__ = ["MainWindow", "SETTINGS_ORG", "SETTINGS_APP"]
 
@@ -100,6 +101,10 @@ class MainWindow(QWidget):
 
     logoutRequested = pyqtSignal()          # 侧栏底部「退出登录」→ 启动器负责换窗口
     closed = pyqtSignal()                   # 用户点 ✕ 把窗口关了 → 启动器负责退出程序
+    #: 后台线程（下载）把进度搬回 GUI 线程用：Qt 跨线程发信号是**排队**的，安全 ——
+    #: 比"共享变量 + 定时器轮询"更跟手，也不用把下载塞进传输层的事件队列。
+    transferProgress = pyqtSignal(str, float)
+    transferFailed = pyqtSignal(str, str)
 
     def __init__(self, parent: QWidget | None = None, *, demo=None,
                  transport=None, settings=None, log=None, confirm=None,
@@ -162,6 +167,7 @@ class MainWindow(QWidget):
         self._notifier = Notifier(icon=None)
         self._notify_enabled = self._saved_notify()
         self._sound_enabled = self._saved_sound()
+        self._close_to_tray = self._saved_close_to_tray()
         self._notifier.set_enabled(self._notify_enabled)
         self._notifier.set_sound_enabled(self._sound_enabled)
         # 各会话"还没发出去的附件/待回复的那条"（和草稿一样按会话存，切换会话不会串台）
@@ -214,6 +220,16 @@ class MainWindow(QWidget):
         self._build_ui()
         self._connect_signals()
         self._install_shortcuts()
+        self._restore_window_state()                 # 上次的位置/大小（屏幕换了就丢弃）
+        # 托盘常驻：图标亮着 + 右键菜单（显示主窗口 / 退出）+ 点图标叫回窗口。
+        # 没托盘（精简系统 / offscreen 测试）时 Notifier 内部全部静默跳过。
+        self._notifier.set_actions(self.show_from_tray, self.quit_from_tray)
+        self._notifier.set_message_click_handler(self.open_from_notification)
+        self._notifier.show_icon()
+        # 「点 ✕ 收进托盘」是个**开关**（默认关，保持 ✕ = 退出的老行为）；
+        # ``_quitting`` 让托盘菜单的「退出」和关窗收托盘这两条路分得清。
+        self._quitting = False
+        self._tray_hint_shown = False
 
         saved = str(self._settings.value("theme", THEME_OPTIONS[0]))
         self.sidebar.set_theme_name(saved if saved in THEME_OPTIONS else THEME_OPTIONS[0])
@@ -245,6 +261,120 @@ class MainWindow(QWidget):
                          min(wanted.height(), available.height() - 60))
         return wanted
 
+    def _geometry_on_screen(self) -> bool:
+        """当前窗口框还在某块屏幕上吗（拔掉外接屏 / 分辨率变小之后会为假）。"""
+        frame = self.frameGeometry()
+        return any(screen.availableGeometry().intersects(frame)
+                   for screen in QGuiApplication.screens())
+
+    def _restore_window_state(self) -> bool:
+        """恢复上次的窗口位置/大小/最大化态；不在任何屏幕里就退回默认尺寸并居中。
+
+        **必须校验屏幕**：那份几何是上次写的，中间可能拔了外接屏、换了显示器、
+        分辨率变小 —— 直接 restore 到屏幕外，用户看到的就是"程序启动了但窗口不见了"。
+        """
+        raw = self._settings.value("window_geometry")
+        if raw is None or not self.restoreGeometry(raw):
+            return False
+        if not self._geometry_on_screen():
+            self.resize(self._preferred_size())
+            self._center_on_primary()
+            return False
+        return True
+
+    def _center_on_primary(self) -> None:
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        self.move(screen.availableGeometry().center() - self.rect().center())
+
+    def _save_window_state(self) -> None:
+        """记住窗口位置/大小（``sync()`` 立刻落盘：写完可能进程就退了）。
+
+        写不进去（注册表只读、磁盘满）也绝不能影响收尾 —— 这只是个便利功能。
+        """
+        try:
+            self._settings.setValue("window_geometry", self.saveGeometry())
+            self._settings.sync()
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def show_from_tray(self) -> None:
+        """从托盘把窗口叫回来：还原最小化 → 抬到最前 → 抢焦点。"""
+        self.show()
+        if self.windowState() & Qt.WindowState.WindowMinimized:
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.raise_()
+        self.activateWindow()
+
+    def quit_from_tray(self) -> None:
+        """托盘菜单「退出 MChat」：走正常的关窗收尾（停线程、存草稿、关库）。
+
+        加载器收到 ``closed`` 才会真的退出进程，所以这里不能直接 ``app.quit()``。
+
+        ``_quitting`` 很关键：用户开了「✕ 收进托盘」之后，这条路**必须真的退**，
+        不能被 closeEvent 里的"收进托盘"逻辑拦下来 —— 否则托盘菜单的退出会变成假按钮。
+        """
+        self._quitting = True
+        self.close()
+
+    def open_from_notification(self, conversation_id: str = "") -> bool:
+        """点了系统通知（或托盘图标）：把窗口叫回来，并切到那条消息的会话。"""
+        self.show_from_tray()
+        conversation_id = str(conversation_id or "")
+        if not conversation_id or self._store.get(conversation_id) is None:
+            return False
+        self.select_conversation(conversation_id)
+        return True
+
+    def open_link(self, url: str) -> bool:
+        """点消息里的链接：**交给系统默认浏览器**，不在聊天窗口里内嵌浏览器。
+
+        只放行 http/https：`file://`、自定义 scheme 这类一律不打开
+        （消息内容来自别人，不能让它触发本地程序）。
+        """
+        target = str(url or "").strip()
+        if not target.lower().startswith(("http://", "https://")):
+            return False
+        try:
+            opened = QDesktopServices.openUrl(QUrl(target))
+        except Exception:                                # noqa: BLE001
+            return False
+        if not opened:
+            self.toast.show_message("打不开这个链接（系统没认出来）", "warning", 2200)
+        return bool(opened)
+
+    # ---- 「✕ 收进托盘」这个开关 -----------------------------------------
+    def _saved_close_to_tray(self) -> bool:
+        """默认**关**：✕ 还是退出程序（老行为）；用户自己勾了才收进托盘。"""
+        return str(self._settings.value("close_to_tray", "false")).lower() == "true"
+
+    def close_to_tray(self) -> bool:
+        return self._close_to_tray
+
+    def set_close_to_tray(self, enabled) -> bool:
+        """勾上就收进托盘。**没有托盘的系统上不给开**（否则 ✕ 之后窗口就找不回来了）。"""
+        wanted = bool(enabled)
+        if wanted and not self._notifier.available():
+            wanted = False
+            self.toast.show_message("这台机器没有系统托盘，开不了这一项", "warning", 2600)
+        self._close_to_tray = wanted
+        self._settings.setValue("close_to_tray", "true" if wanted else "false")
+        self._sync_settings_dialog(close_to_tray=wanted)
+        return wanted
+
+    def _minimize_to_tray(self) -> None:
+        """把窗口收进托盘（不退出）：只提示第一次，免得每次关都弹一句废话。"""
+        self.hide()
+        if not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            try:
+                self._notifier.message("MChat 还在后台", "点托盘图标可以回到窗口；"
+                                                      "要退出请用托盘菜单「退出 MChat」",
+                                       conversation_id="")
+            except Exception:                            # noqa: BLE001
+                pass
+
     def _build_ui(self) -> None:
         self.sidebar = Sidebar(self._store, self)
         self.split_handle = SplitHandle(
@@ -264,7 +394,24 @@ class MainWindow(QWidget):
         row.addWidget(self.split_handle)
         row.addWidget(self.chat_view, 1)
 
+        # 自绘标题条 + 无边框：系统标题栏（连它那个 ✕）不再出现，窗口自带 ─ □ ✕。
+        # 无边框之后系统也不给缩放边框了，八条边由 FramelessResizer 补回来（原生缩放）。
+        self.chrome = install_app_chrome(self, title=self.windowTitle(),
+                                         controls=CHROME_WINDOW)
+        self._resizer = FramelessResizer(self)
+        self._resizer.attach()
+
         self.toast = Toast(self, bottom_offset=70)   # 抬到输入栏上方，别挡住正在打的消息
+
+        # 拖文件进窗口：整个窗口都接（输入框自己会拦一层，见 MessageEdit）。落点提示是
+        # 一个不进布局的浮层，按需显隐 —— 拖到一半反悔（Esc/拖出窗口）时会自己收掉。
+        self.setAcceptDrops(True)
+        self._drop_hint = QLabel("松开鼠标即可发送文件", self)
+        self._drop_hint.setObjectName("dropHint")
+        self._drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._drop_hint.setFixedSize(340, 96)
+        self._drop_hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._drop_hint.setVisible(False)
 
     def _connect_signals(self) -> None:
         self.sidebar.conversationSelected.connect(self.select_conversation)
@@ -283,6 +430,11 @@ class MainWindow(QWidget):
         self.chat_view.attachRequested.connect(self.attach_file)
         self.chat_view.attachmentRequested.connect(self.attachment_action)
         self.chat_view.imagePasted.connect(self.attach_pasted_image)
+        self.chat_view.filesDropped.connect(self.attach_paths)
+        self.chat_view.linkActivated.connect(self.open_link)     # 点正文里的链接
+        # 下载进度：信号从后台线程发出来，排队回到 GUI 线程再画
+        self.transferProgress.connect(self.chat_view.set_download_progress)
+        self.transferFailed.connect(self.chat_view.set_download_failed)
         # 气泡右键菜单：回复 / 复制 / 置顶 / 转发 / 批量选择
         self.chat_view.replyRequested.connect(self.start_reply)
         self.chat_view.copyRequested.connect(self.copy_message)
@@ -641,8 +793,18 @@ class MainWindow(QWidget):
                 else resolve_attachment_path(self.attachment_dir(),
                                              attachment.remote_id, attachment.name))
 
+        def report(done: int, total: int) -> None:
+            """后台线程里报进度：发信号排队回 GUI 线程（总长未知时就不画百分比）。"""
+            if total:
+                self.transferProgress.emit(message_id, min(1.0, done / total))
+
         def work():
-            api.download(attachment.source_id, dest, root=self.attachment_dir())
+            try:
+                api.download(attachment.source_id, dest, root=self.attachment_dir(),
+                             on_progress=report)
+            except Exception as error:               # 失败也要让气泡上说一句"点一下重试"
+                self.transferFailed.emit(message_id, str(error))
+                raise
             return {"kind": "download", "message_id": message_id, "path": dest,
                     "open": open_after, "view": view_after}
 
@@ -1499,6 +1661,67 @@ class MainWindow(QWidget):
                                 CLIPBOARD_DIRNAME)
         return os.path.join(tempfile.gettempdir(), "mchat-clipboard")
 
+    def attach_paths(self, paths) -> Attachment | None:
+        """把拖进来 / 粘进来的本地文件挂到待发送条（和「选文件」**同一条路**）。
+
+        故意不马上发出去：挂到待发送条上，用户可以补一句配文再按 Enter（截图发过去总
+        得说句话）。一次只带一个 —— :class:`~mchat.core.transport.Outgoing` 里只有一格
+        附件位，多选就明说而不是默默丢掉后面的。
+        """
+        files = [p for p in (paths or []) if p and os.path.isfile(p)]
+        if not files:
+            self.toast.show_message("拖过来的不是本地文件，没接住", "warning", 2000)
+            return None
+        if len(files) > 1:
+            self.toast.show_message(
+                f"一次只能带一个附件，先放上「{os.path.basename(files[0])}」", "info", 2600)
+        attachment = Attachment.from_path(files[0])
+        self.chat_view.set_attachment(attachment)
+        self.chat_view.focus_input()
+        return attachment
+
+    # ---- 拖放（窗口级：输入框之外的地方，比如消息区、侧栏）-----------------
+    def dragEnterEvent(self, event) -> None:             # noqa: N802
+        """本地文件就接住并给落点提示；拖文字/链接过来不接，交回 Qt 默认处理。"""
+        if local_file_paths(event.mimeData()):
+            self._show_drop_hint()
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:              # noqa: N802
+        if local_file_paths(event.mimeData()):
+            self._show_drop_hint()
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event) -> None:             # noqa: N802
+        self._hide_drop_hint()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:                  # noqa: N802
+        self._hide_drop_hint()
+        paths = local_file_paths(event.mimeData())
+        if paths:
+            event.acceptProposedAction()
+            self.attach_paths(paths)
+            return
+        super().dropEvent(event)
+
+    def _show_drop_hint(self) -> None:
+        self._position_drop_hint()
+        self._drop_hint.setVisible(True)
+        self._drop_hint.raise_()
+
+    def _hide_drop_hint(self) -> None:
+        self._drop_hint.setVisible(False)
+
+    def _position_drop_hint(self) -> None:
+        """提示浮层居中（窗口尺寸变了要跟着走，所以 resizeEvent 里也调一次）。"""
+        self._drop_hint.move((self.width() - self._drop_hint.width()) // 2,
+                             (self.height() - self._drop_hint.height()) // 2)
+
     def attachment_action(self, message_id: str, action: str = "open") -> bool:
         """附件上的动作：看大图（``"view"``）/ 用系统程序打开（``"open"``）/ 打开所在文件夹。
 
@@ -1674,6 +1897,8 @@ class MainWindow(QWidget):
             elif event.kind == EVENT_ATTACHMENT_SENT:
                 # 我发出去的附件在服务端叫什么 id：记下来（本地那份删了还能取回）
                 self._apply_attachment_sent(event)
+            elif event.kind == EVENT_UPLOAD_PROGRESS:
+                self._apply_upload_progress(event)
             elif event.kind in FRIEND_EVENT_KINDS:
                 self._apply_friend_event(event)
             elif event.kind == EVENT_RESYNC:
@@ -1853,6 +2078,7 @@ class MainWindow(QWidget):
             if message.conversation_id == self._current_id and not message.outgoing:
                 self._store.mark_read(message.conversation_id)
                 self._sync_read_to_server(message.conversation_id, message.ts)
+                self._sync_tray_unread()               # 已读之后未读数要跟着掉
         self.sidebar.refresh_item(event.conversation_id)
 
     # ======================================================================
@@ -1889,13 +2115,14 @@ class MainWindow(QWidget):
             dialog.animationsToggled.connect(self.set_animations)
             dialog.notifyToggled.connect(self.set_notifications)
             dialog.soundToggled.connect(self.set_sound_enabled)
+            dialog.closeToTrayToggled.connect(self.set_close_to_tray)
             dialog.openDataDirRequested.connect(self.open_data_dir)
             self._settings_dialog = dialog
         dialog = self._settings_dialog
         dialog.sync(theme_name=self.theme_name(), font_scale=self.text_scale(),
                     animations=self.animations_enabled(), stats=self._log.stats(),
                     notifications=self.notifications_enabled(),
-                    sound=self.sound_enabled(),
+                    sound=self.sound_enabled(), close_to_tray=self._close_to_tray,
                     data_path=self._log.path, transport=self._transport.name)
         dialog.apply_palette(self.current_palette())
         dialog.show()
@@ -1910,13 +2137,15 @@ class MainWindow(QWidget):
                               font_scale: float | None = None,
                               animations: bool | None = None,
                               notifications: bool | None = None,
-                              sound: bool | None = None) -> None:
+                              sound: bool | None = None,
+                              close_to_tray: bool | None = None) -> None:
         """别处（菜单/侧栏）改了设置时，把设置窗口里的控件同步过去（不回抛信号）。"""
         if self._settings_dialog is None:
             return
         self._settings_dialog.sync(theme_name=theme_name, font_scale=font_scale,
                                    animations=animations,
-                                   notifications=notifications, sound=sound)
+                                   notifications=notifications, sound=sound,
+                                   close_to_tray=close_to_tray)
 
     # ======================================================================
     # 桌面通知 / 提示音
@@ -1995,9 +2224,35 @@ class MainWindow(QWidget):
         if not body:
             body = "发来一条新消息"
         try:
-            self._notifier.message(title, body)
+            self._notifier.message(title, body, conversation_id=conversation_id)
         except Exception:                            # noqa: BLE001 —— 通知不许影响收消息
             pass
+        self._sync_tray_unread()                     # 托盘提示跟着未读数走
+        self._flash_taskbar()                        # 窗口没在前台：任务栏闪一下
+
+    def _sync_tray_unread(self) -> None:
+        """把未读总数写到托盘提示上（免打扰的会话不计 —— 口径和侧栏徽标一致，只有一份）。"""
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.set_unread(self._store.total_unread())
+        except Exception:                            # noqa: BLE001
+            pass
+
+    def _flash_taskbar(self) -> None:
+        """窗口不在前台时闪任务栏（Windows 的高亮边框）；一直闪到用户回来看为止。"""
+        try:
+            if not self.isActiveWindow():
+                QApplication.alert(self, 0)
+        except Exception:                            # noqa: BLE001 —— 闪不了也不影响收消息
+            pass
+
+    def _apply_upload_progress(self, event) -> None:
+        """附件上传进度：绿条往前走；这一轮失败了就写"正在重试"（发件箱会自动退避重发）。"""
+        if event.failed:
+            self.chat_view.set_upload_failed(event.message_id, event.error)
+            return
+        self.chat_view.set_upload_progress(event.message_id, event.progress)
 
     def _apply_attachment_sent(self, event) -> None:
         """记下"我这条消息的附件在服务端是哪一份"，并存进本地库。
@@ -2144,6 +2399,7 @@ class MainWindow(QWidget):
         self.split_handle.apply_palette(p)
         self.chat_view.apply_palette(p)
         self.toast.apply_palette(p)
+        self.chrome.apply_palette(p)
         if self._tool_dialog is not None:
             self._tool_dialog.apply_palette(p)
         if self._search_dialog is not None:
@@ -2254,6 +2510,7 @@ class MainWindow(QWidget):
                 text=(f"会清掉这台电脑上 {name} 的登录信息，下次打开要重新登录。"
                       "本地的聊天记录不会被删。")):
             return False
+        self._save_window_state()                    # 换账号回来时还是这个窗口位置
         self.logoutRequested.emit()
         return True
 
@@ -2270,6 +2527,7 @@ class MainWindow(QWidget):
             return
         self._shutdown_done = True
         self._poller.stop()
+        self._resizer.detach()          # 摘掉挂在全应用上的鼠标过滤器（留着会崩，见 detach）
         # 关窗前把还压在发件箱里的消息尽量送出去（有上限，别让"关窗口"卡住）。
         # 现在关窗＝整个进程立刻退出，不给发件箱一点时间的话，刚敲完的那句
         # 就只留在本地库里、永远发不出去（本地演示/离线传输层没有 flush，跳过）。
@@ -2284,6 +2542,7 @@ class MainWindow(QWidget):
                 pass
         # stop() 里会先 api.abort() 把挂在半空的长轮询/上传掐断，所以这里不等网络。
         self._transport.stop()
+        self._save_window_state()                        # 记住位置/大小，下次开在原处
         self._notifier.stop()                            # 收掉托盘 / 停掉提示音（幂等）
         for dialog in (self._search_dialog, self._settings_dialog, self._forward_dialog,
                        self._merged_viewer, self._image_viewer, self._new_chat_dialog,
@@ -2296,8 +2555,15 @@ class MainWindow(QWidget):
     def resizeEvent(self, event) -> None:                # noqa: N802
         super().resizeEvent(event)
         self.toast.reposition()
+        self._position_drop_hint()
 
     def closeEvent(self, event) -> None:                 # noqa: N802
+        # 「✕ 收进托盘」（默认关）：只把窗口藏起来，消息照收、通知照弹；
+        # 托盘菜单的「退出」走 ``quit_from_tray``（先置 _quitting）才会真的退。
+        if self._close_to_tray and not self._quitting and self._notifier.available():
+            event.ignore()
+            self._minimize_to_tray()
+            return
         self.shutdown()
         super().closeEvent(event)
         # 收尾**之后**再告诉启动器"用户把窗口关了 → 程序该退了"。

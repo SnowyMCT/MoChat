@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
 
 from ..core.atrest import AtRestError, materialize
 from .theme import build_qss
+from .widgets import install_app_chrome
 
 __all__ = ["ImageViewerDialog", "ZOOM_MIN", "ZOOM_MAX", "ZOOM_STEP"]
 
@@ -173,6 +174,9 @@ class ImageViewerDialog(QDialog):
         root.addWidget(self.bar)
 
         self._apply_display()
+
+        # 无边框 + 自绘 ✕。标题留空：图名/第几张在自己那条信息栏里写着，别重复
+        self.chrome = install_app_chrome(self, title="")
 
     # ------------------------------------------------------------------ 构造
     def _nav_button(self, text, tip, slot) -> QPushButton:
@@ -396,6 +400,10 @@ class ImageViewerDialog(QDialog):
     def apply_palette(self, palette) -> None:
         self._palette = palette
         self.setStyleSheet(build_qss(palette))
+        # 图片区整块是深色画布：标题条跟底部那条信息栏同色，别在顶上留一条浅灰
+        self.chrome.setStyleSheet(
+            f"QFrame#chrome {{ background-color: {palette.card}; border: none; }}")
+        self.chrome.apply_palette(palette)
 
     # ------------------------------------------------------------------ 事件
     def resizeEvent(self, event) -> None:                # noqa: N802

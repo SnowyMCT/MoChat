@@ -87,7 +87,8 @@ class FakeApi:
         self.sent.append({"cid": conversation_id, "id": client_id, "text": text, **kwargs})
         return _message_json(message_id=client_id, text=text, sender=ME)
 
-    def upload(self, path, name=None):
+    def upload(self, path, name=None, on_progress=None):
+        # 真客户端会传 on_progress=（附件上传进度），假客户端收下不用，但签名得对得上
         self.uploads.append(name or os.path.basename(path))
         return {"id": self.upload_id, "name": name or os.path.basename(path),
                 "size": os.path.getsize(path)}

@@ -37,6 +37,10 @@ __all__ = ["ApiError", "NetworkError", "ApiClient", "SendResult", "user_from_jso
 DEFAULT_TIMEOUT = 15.0
 SYNC_TIMEOUT_SLACK = 10.0        # 长轮询的 HTTP 超时 = 服务端等待时间 + 这点余量
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+#: 小于这个大小就不走"分块发送 + 报进度"那条路（见 ``ApiClient.upload`` 里的说明）：
+#: 256 KB 以下一次 sendall 就完了，进度条没意义；而分块发送遇上"服务端还没读 body
+#: 就回 401/413 并关连接"会退化成连接被中止，小请求不值得冒这个险。
+STREAM_UPLOAD_MIN = 256 * 1024
 REMOTE_SCHEME = Attachment.REMOTE_SCHEME     # 附件"还没下载到本地"时路径用的是它
 
 
@@ -460,6 +464,35 @@ def friend_requests_from_json(items, *, me_id: str = "") -> list[FriendRequest]:
 # ---------------------------------------------------------------------------
 # 客户端
 # ---------------------------------------------------------------------------
+class _ProgressReader:
+    """把要上传的字节分块喂给 http.client，顺手报进度。
+
+    为什么不用 ``bytes`` 直接当 body：urllib 只有在拿到定长对象时才知道 Content-Length，
+    而"边传边报进度"必须自己控制分块发送。**故意不实现 ``__len__``** —— HTTP 层的
+    Content-Length 由 :meth:`ApiClient.upload` 显式写死，这里再暴露长度会让 urllib
+    自己再加一个头（两个 Content-Length = 服务端直接读歪）。
+    """
+
+    def __init__(self, payload: bytes, on_progress=None, *, chunk: int = 64 * 1024):
+        self._payload = payload
+        self._view = memoryview(payload)
+        self._chunk = max(1, int(chunk))
+        self._sent = 0
+        self._on_progress = on_progress
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self._chunk
+        piece = bytes(self._view[self._sent:self._sent + size])
+        self._sent += len(piece)
+        if self._on_progress is not None:
+            try:
+                self._on_progress(self._sent, len(self._payload))
+            except Exception:                        # noqa: BLE001 —— 报进度不许弄坏发送
+                pass
+        return piece
+
+
 class ApiClient:
     """MChat 服务端客户端。一个实例对应"一个账号 + 一个服务器"。"""
 
@@ -506,15 +539,20 @@ class ApiClient:
                 url += "?" + urllib.parse.urlencode(clean)
         return url
 
-    def _request(self, method: str, path: str, *, body=None, raw: bytes | None = None,
+    def _request(self, method: str, path: str, *, body=None, raw=None,
                  query: dict | None = None, timeout: float | None = None,
-                 auth: bool = True) -> bytes:
+                 auth: bool = True, content_length: int | None = None,
+                 on_progress=None) -> bytes:
         url = self._url(path, query)
         data = None
         headers = {"User-Agent": self.user_agent, "Accept": "application/json"}
         if raw is not None:
             data = raw
             headers["Content-Type"] = "application/octet-stream"
+            # 传的是**文件对象**（上传要报进度）时 urllib 不会自己算长度，我们必须给 ——
+            # 服务端按 Content-Length 收；不给的话它会走 chunked，那边读不出来。
+            if content_length is not None:
+                headers["Content-Length"] = str(int(content_length))
         elif body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
@@ -525,7 +563,7 @@ class ApiClient:
             # 走自己的 opener（不是 urllib.request.urlopen）：这样这条连接能被
             # ApiClient.abort() 立刻掐断 —— 关窗口时不用干等长轮询挂完。
             with self._opener.open(request, timeout=timeout or self.timeout) as response:
-                return response.read()
+                return self._read_body(response, on_progress)
         except urllib.error.HTTPError as error:            # 服务端明确回了错误
             payload = b""
             try:
@@ -538,6 +576,32 @@ class ApiClient:
             raise NetworkError(str(getattr(error, "reason", error)), url=url) from None
         except (TimeoutError, OSError) as error:
             raise NetworkError(str(error), url=url) from None
+
+    def _read_body(self, response, on_progress=None) -> bytes:
+        """读响应体。给了 ``on_progress`` 就分块读并报 ``(已读, 总长)``（下载进度条的数据源）。
+
+        ``总长`` 取自 ``Content-Length``；服务端没给（或被代理改写）时是 0，
+        报进度的一方要自己判 0 就别画百分比。
+        """
+        if on_progress is None:
+            return response.read()
+        try:
+            total = int(response.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        chunks: list[bytes] = []
+        done = 0
+        while True:
+            block = response.read(64 * 1024)
+            if not block:
+                break
+            done += len(block)
+            chunks.append(block)
+            try:
+                on_progress(done, total)
+            except Exception:                        # noqa: BLE001 —— 报进度不许弄坏下载
+                pass
+        return b"".join(chunks)
 
     def _json(self, method: str, path: str, **kwargs) -> dict:
         payload = self._request(method, path, **kwargs)
@@ -692,11 +756,15 @@ class ApiClient:
                           timeout=timeout + SYNC_TIMEOUT_SLACK)
 
     # ------------------------------------------------------------------ 附件
-    def upload(self, path: str, *, name: str | None = None) -> dict:
+    def upload(self, path: str, *, name: str | None = None, on_progress=None) -> dict:
         """上传一个本地文件，返回 ``{"id","name","size"}``。
 
         本地附件缓存是**加密落盘**的，所以发之前先按需解密 —— 否则传上去的是密文，
         对面下回来打不开（客户端侧这块一直是透明的：界面只给路径）。
+
+        ``on_progress(done, total)`` 可选：给了就**边传边报**（附件上传进度条的数据源）。
+        那条路要把字节包成一个可读对象交给 http.client 分块发送，所以 Content-Length
+        得我们自己写死 —— 不写的话 urllib 走 chunked，服务端读不出长度。
         """
         with open(path, "rb") as handle:
             payload = handle.read()
@@ -706,17 +774,30 @@ class ApiClient:
         if len(payload) > MAX_UPLOAD_BYTES:
             raise ApiError("too_large", "文件超过 64 MB，客户端就没打算发", 413)
         filename = name or os.path.basename(path)
-        data = self._json("POST", "/api/upload", raw=payload, timeout=120.0,
-                          query={"name": filename})
+        # 小文件不走"分块发送 + 报进度"：一次 sendall 就完了（进度条也来不及看见），
+        # 而分块发送遇到"服务端还没读 body 就回 401/413 并关连接"会退化成
+        # 连接被中止（NetworkError），把本来干净的 HTTP 错误吃掉。大文件才值得换。
+        if on_progress is not None and len(payload) >= STREAM_UPLOAD_MIN:
+            body, extra = _ProgressReader(payload, on_progress), {"content_length": len(payload)}
+        else:
+            body, extra = payload, {}
+            if on_progress is not None:
+                on_progress(len(payload), len(payload))     # 小文件：直接报满
+        data = self._json("POST", "/api/upload", raw=body, timeout=120.0,
+                          query={"name": filename}, **extra)
         return dict(data.get("attachment") or {})
 
-    def download(self, attachment_id: str, dest_path: str, *, root: str = "") -> str:
+    def download(self, attachment_id: str, dest_path: str, *, root: str = "",
+                 on_progress=None) -> str:
         """把附件下到 ``dest_path``（父目录不存在会自动建）。返回落地的路径。
 
         落地路径必须由 :func:`mchat.core.paths.resolve_attachment_path` 算出来
         （它保证落在下载目录里）。``root`` 给了就再校验一次"确实在 root 里面"：
         路径字符串自己是分不出好坏的（见 core/paths.py 里的说明），但**调用方知道
         自己想把文件写到哪个目录**，所以就由调用方把它交进来。
+
+        ``on_progress(done, total)`` 可选：给了就**边下边报**（取回大附件时那条进度线）。
+        落盘仍是一次写完（先落 ``.part`` 再 ``os.replace``），所以半截文件不会留在目标路径。
         """
         dest_path = os.path.abspath(dest_path)
         if root and not is_inside(root, dest_path):
@@ -727,7 +808,8 @@ class ApiClient:
         folder = os.path.dirname(dest_path)
         if folder:
             os.makedirs(folder, exist_ok=True)
-        payload = self._request("GET", f"/api/files/{attachment_id}", timeout=120.0)
+        payload = self._request("GET", f"/api/files/{attachment_id}", timeout=120.0,
+                                on_progress=on_progress)
         cipher = active_cipher()
         if cipher is not None and cipher.available:
             # 落盘即密文：附件缓存里不该留明文（要看清它得先过 materialize）

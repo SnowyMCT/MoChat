@@ -48,6 +48,8 @@ FRIEND_EVENT_KINDS = (EVENT_FRIEND_REQUEST, EVENT_FRIEND_ACCEPT,
                       EVENT_FRIEND_REJECT, EVENT_FRIEND_REMOVE)
 EVENT_SEND_BLOCKED = "send_blocked"       # 我发的消息被好友门禁拦成了申请（不重发）
 EVENT_ATTACHMENT_SENT = "attachment_sent"  # 我发的附件在服务端的 id（本地删了能取回）
+#: 附件上传进度（传出方向的事件：界面据此画进度条 / 显示"重试中"）
+EVENT_UPLOAD_PROGRESS = "upload_progress"
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,12 @@ class TransportEvent:
     note: str = ""             # EVENT_FRIEND_REQUEST / EVENT_SEND_BLOCKED 用：留言
     #: EVENT_ATTACHMENT_SENT 用：我刚发出去的附件在服务端叫什么 id
     attachment_id: str = ""
+    #: EVENT_UPLOAD_PROGRESS 用：这次附件上传传到几分（0~1；-1 = 不适用）
+    progress: float = -1.0
+    #: EVENT_UPLOAD_PROGRESS 用：这一轮上传失败了（发件箱会自动退避重试）
+    failed: bool = False
+    #: EVENT_UPLOAD_PROGRESS 用：失败原因（界面写"上传失败，正在重试"旁边那行小字）
+    error: str = ""
 
 
 @dataclass
