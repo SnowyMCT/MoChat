@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.pytest_cache/
 
 # 测试产出的截图
 artifacts/
@@ -16,6 +17,8 @@ dist/
 # 服务端本地数据（sqlite + 上传的附件）—— 部署时临时生成，不进仓库
 server/data/
 
-# 编辑器
-.idea/workspace.xml
-.idea/shelf/
+# 本地打包/发布压缩包（如 server/server.zip）
+*.zip
+
+# 编辑器（整个 IDE 目录都不进仓库，本地留着照常用）
+.idea/
